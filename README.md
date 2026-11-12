@@ -17,7 +17,7 @@ of H100s, in the browser and inside React.
 
 [![Spec and libraries](https://img.shields.io/badge/spec%20%26%20libraries-Apache%202.0%20%7C%20MIT-blue.svg)](LICENSING.md) [![Compiler](https://img.shields.io/badge/compiler-free%20to%20use-8b5cff.svg)](LICENSING.md) [![Status](https://img.shields.io/badge/status-preview-orange.svg)](#status) [![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows%20%7C%20browser-lightgrey.svg)](https://zyth.io)
 
-<a href="https://zyth.io/play/"><img src="docs/assets/buttons/try.svg" alt="Try Zyth in your browser: the playground, no install" width="300"></a>&nbsp;<a href="https://zyth.io"><img src="docs/assets/buttons/website.svg" alt="Visit zyth.io" width="300"></a>&nbsp;<a href="ZYTH-SPEC.md"><img src="docs/assets/buttons/spec.svg" alt="Read the Zyth language specification" width="300"></a>
+<a href="https://zyth.io/play/"><img src="docs/assets/buttons/try.svg" alt="Try Zyth in your browser: the playground, no install" width="270"></a>&nbsp;<a href="https://zyth.io"><img src="docs/assets/buttons/website.svg" alt="Visit zyth.io" width="270"></a>&nbsp;<a href="ZYTH-SPEC.md"><img src="docs/assets/buttons/spec.svg" alt="Read the Zyth language specification" width="270"></a>
 
 <sub>The playground runs the real Zyth in your browser through WebAssembly. Nothing to install.</sub>
 
