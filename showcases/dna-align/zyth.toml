@@ -1,0 +1,4 @@
+[package]
+name = "dna-align"
+version = "0.1.0"
+description = "Smith-Waterman DNA search, one GPU thread per database sequence"

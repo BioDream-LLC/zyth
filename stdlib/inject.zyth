@@ -1,0 +1,22 @@
+/// Components wired together before the program runs (module `zyth.inject`).
+///
+/// A component is a function marked `@component` (what it returns is the component; its
+/// parameters are the components it needs) or a struct marked `@component` (its fields are
+/// filled with components). `container()` makes them in dependency order. `zyth check` reports
+/// a missing component, two that provide the same type, a cycle, and an app component that
+/// needs a request one, before the program runs.
+///
+///     @component
+///     fn settings() -> Settings = Settings { url: "sqlite::memory:" }
+///
+///     @component
+///     struct Store { settings: Settings }
+///
+///     let app = container()
+///     print(app.get(Store).settings.url)
+
+/// Marks a component. `scope`: "app" (one for the whole container), "request" (a new one in
+/// each `app.request()`) or "test" (used instead of the others for its type, only in
+/// `container(test: true)`: a fake mailer, an in-memory store). `primary`: the one to use when
+/// several provide the same type.
+pub annotation component(scope: str = "app", primary: bool = false) on fn, struct

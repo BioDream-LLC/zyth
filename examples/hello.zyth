@@ -1,0 +1,2 @@
+// zyth run examples/hello.zyth
+print("Hello, Zyth!")

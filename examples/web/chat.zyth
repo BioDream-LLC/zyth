@@ -1,0 +1,12 @@
+@target(web)
+use zyth.web.{dom}
+use zyth.nn.Transformer
+use zyth.data.text
+
+let tok = text.tokenizer("gpt2")
+let model = Transformer.load("tiny-gpt.zyth.model")?
+
+dom.on("#go", "click") { _ ->
+    let prompt = dom.value("#prompt")
+    dom.set_text("#output", model.generate(tok.encode(prompt), max_tokens: 200) |> tok.decode)
+}

@@ -1,0 +1,1067 @@
+/// Training methods (module `zyth.train`, spec Section 19.1).
+///
+/// `sft`, `dpo`, `grpo`, `distill`, and `fit` are ordinary Zyth functions over
+/// any causal language model `m(ids) -> logits` (the `zyth.nn.Transformer`,
+/// `zyth.nn.arch.GPT2`, and `zyth.nn.arch.Llama` models, and models from
+/// `hub.load`). `lora(...)` adapters train a few small matrices instead of the
+/// whole model; the result is merged back, so a tuned model has the same
+/// architecture as the base model and saves, loads, and exports like it.
+
+use zyth.train.native.{adapt, freeze, unfreeze, copy_model, trainable, layer_names, hub_name, replicate, split_batch, average_grads, copy_weights, partition, share_owned, save_states, ckpt_begin, ckpt_commit, ckpt_latest, rng_state, set_rng_state}
+use zyth.optim.{AdamW, cosine_lr, clip_grad_norm}
+use zyth.math.random.{shuffle}
+use zyth.fs
+use zyth.json
+use zyth.dist
+
+// ------------------------------------------------------------------ LoRA
+
+/// A LoRA adapter configuration (Hu et al., 2021): `lora(rank: 16, targets: [q_proj, v_proj])`.
+pub struct LoraConfig {
+    rank: i64
+    alpha: f64
+    dropout: f64
+    targets: str[]
+}
+
+/// LoRA adapters of rank `rank` on the layers named in `targets` (field names
+/// such as `q_proj`, or dotted paths). The update is scaled by `alpha / rank`;
+/// `alpha` defaults to `2 * rank`. Without targets, the attention projections
+/// of the architecture are adapted (`q_proj`/`v_proj`, GPT-2's `c_attn`, or
+/// `qkv`).
+pub fn lora(rank: i64 = 8, alpha: f64 = 0.0, dropout: f64 = 0.0, targets = []) -> LoraConfig {
+    return LoraConfig { rank: rank, alpha: if alpha > 0.0 { alpha } else { 2.0 * rank as f64 }, dropout: dropout, targets: targets.map(|t| str(t)) }
+}
+
+/// A frozen linear layer plus a trainable low-rank update:
+/// `base(x) + (x @ lora_a @ lora_b) * scale`. `lora_b` starts at zero, so a
+/// new adapter does not change the model.
+pub model LoRA(base, in_features: i64, out_features: i64, rank: i64 = 8, alpha: f64 = 16.0, p: f64 = 0.0) {
+    base = base
+    lora_a = (tensor.rand(in_features, rank) * 2.0 - 1.0) * (1.0 / sqrt(in_features as f64))
+    lora_b = tensor.zeros(rank, out_features)
+    scale = alpha / rank as f64
+
+    fn forward(self, x) {
+        let h = if p > 0.0 { dropout(x, p: p) } else { x }
+        return self.base(x) + (h @ self.lora_a @ self.lora_b) * self.scale
+    }
+}
+
+/// The `[in, out]` weight of a linear layer (`Linear.w` or GPT-2's `Conv1D.weight`).
+fn linear_weight(layer, path: str) {
+    let kind = type_of(layer)
+    if kind == "Linear" {
+        return layer.w
+    }
+    if kind == "Conv1D" {
+        return layer.weight
+    }
+    panic("lora: `{path}` is a {kind}, not a linear layer (Linear or Conv1D)")
+}
+
+/// The attention projections adapted when `lora()` gets no `targets`.
+fn default_targets(model) -> str[] {
+    let names = layer_names(model).map(|e| e.0.split(".")[-1])
+    for group in [["q_proj", "v_proj"], ["c_attn"], ["qkv"]] {
+        if group.all(|g| names.contains(g)) {
+            return group
+        }
+    }
+    panic("lora: no default targets for a {type_of(model)}; pass targets: [...] (layers: {names.unique().join(", ")})")
+}
+
+/// `model` with LoRA adapters on the layers `cfg` names; every other
+/// parameter is frozen. The original model is not changed.
+pub fn apply_lora(model, cfg: LoraConfig) {
+    let targets = if cfg.targets.is_empty() { default_targets(model) } else { cfg.targets }
+    let (adapted, n) = adapt(freeze(model), targets, |layer, path| {
+        let w = linear_weight(layer, path)
+        return LoRA(layer, w.shape[0], w.shape[1], rank: cfg.rank, alpha: cfg.alpha, p: cfg.dropout).to(w.device)
+    })
+    if n == 0 {
+        let names = layer_names(model).map(|e| e.0.split(".")[-1]).unique()
+        panic("lora: no layer is named {targets.join(", ")} (layers: {names.join(", ")})")
+    }
+    return adapted
+}
+
+/// Fold every LoRA adapter into its base layer: `w + lora_a @ lora_b * scale`.
+/// The result has the base architecture and trainable parameters.
+pub fn merge_lora(model) {
+    let (merged, _) = adapt(model, [], types: ["LoRA"], f: |l, _| {
+        var base = l.base
+        let delta = no_grad { (l.lora_a @ l.lora_b) * l.scale }
+        if type_of(base) == "Linear" {
+            base.w = no_grad { base.w + delta }
+        } else {
+            base.weight = no_grad { base.weight + delta }
+        }
+        return base
+    })
+    return unfreeze(copy_model(merged))
+}
+
+/// The adapter matrices of a LoRA model, by layer path (for `save_adapter`).
+pub fn adapter_weights(model) {
+    return model.named_params().filter(|e| e.0.ends_with("lora_a") || e.0.ends_with("lora_b"))
+}
+
+// ------------------------------------------------------------------ data
+
+/// The default prompt format: the prompt, then a newline unless it already ends with whitespace.
+pub fn plain(prompt: str) -> str {
+    if prompt.ends_with("\n") || prompt.ends_with(" ") {
+        return prompt
+    }
+    return prompt + "\n"
+}
+
+/// A ChatML prompt format (`<|im_start|>user ... <|im_start|>assistant`), with an optional system message.
+pub fn chatml(system: str = "") {
+    return |prompt| {
+        let sys = if system.is_empty() { "" } else { "<|im_start|>system\n{system}<|im_end|>\n" }
+        return "{sys}<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
+    }
+}
+
+/// The tokenizer for `model`: `tokenizer` if given, else the Hub tokenizer of a `hub.load` model.
+fn tokenizer_for(model, tokenizer) {
+    if tokenizer != None {
+        return tokenizer
+    }
+    return match hub_name(model) {
+        Some(name) => hub.tokenizer(name)
+        None       => panic("pass tokenizer: ... (the model was not loaded with hub.load, so its tokenizer is unknown)")
+    }
+}
+
+/// The token that ends a response: `stop` if given (≥ 0), else the tokenizer's end-of-text token, else none (-1).
+fn stop_token(tok, stop: i64) -> i64 {
+    if stop >= 0 {
+        return stop
+    }
+    return match tok.eos_id {
+        Some(id) => id
+        None     => -1
+    }
+}
+
+/// A field of a training example (a record or map).
+fn field(ex, name: str) -> str {
+    if type_of(ex) == "str" && name == "prompt" {
+        return ex
+    }
+    return match ex.get(name) {
+        Some(v) => str(v)
+        None    => panic("training example has no `{name}` field: {ex}")
+    }
+}
+
+/// Token ids of `prompt` + `response` (+ `stop`) and their labels: the next
+/// token at every response position, -100 (ignored) at prompt positions.
+/// Sequences longer than `max_len` are cut at the end.
+pub fn completion_tokens(tok, prompt: str, response: str, stop: i64 = -1, max_len: i64 = 1024) -> (i64[], i64[]) {
+    let p = tok.encode(prompt)
+    var r = tok.encode(response)
+    if stop >= 0 {
+        r.push(stop)
+    }
+    var ids = p + r
+    var labels = p.map(|_| -100) + r
+    if ids.len() > max_len + 1 {
+        ids = ids[:max_len + 1]
+        labels = labels[:max_len + 1]
+    }
+    return (ids[:-1], labels[1:])
+}
+
+/// Rows of ids padded on the right with `value` into a `[rows, longest]` tensor.
+pub fn pad(rows, value: i64 = 0) -> tensor<i64, [_, _]> {
+    let n = rows.map(|r| r.len()).max()
+    return tensor.from(rows.map(|r| r + [value] * (n - r.len())))
+}
+
+/// The device of a model's first parameter.
+pub fn device_of(model) {
+    return model.params[0].device
+}
+
+/// Sum of the log-probabilities of the labelled tokens of each row: `[rows]`.
+pub fn sequence_logprobs(model, ids, labels) {
+    return token_logprobs(model(ids), labels).sum(-1)
+}
+
+fn batches(items, size: i64, shuffled: bool) {
+    let xs = if shuffled { shuffle(items) } else { items }
+    return xs.chunks(max(1, size))
+}
+
+fn log_line(name: str, step: i64, total: i64, values) {
+    print("{name} step {step}/{total}: {values}")
+}
+
+/// The learning rate at `step`: linear warmup over `warmup` steps, then
+/// constant (`schedule: "constant"`) or cosine decay to `lr / 10` (`"cosine"`).
+pub fn lr_at(step: i64, total: i64, lr: f64, schedule: str = "constant", warmup: i64 = 0) -> f64 {
+    if step < warmup {
+        return lr * (step + 1) as f64 / warmup as f64
+    }
+    if schedule == "cosine" {
+        return cosine_lr(step, total: total, max_lr: lr, min_lr: lr * 0.1, warmup: warmup)
+    }
+    return lr
+}
+
+/// The model to train: adapters on a frozen copy, or an independent copy with every parameter trainable.
+fn trainable_model(model, adapter) {
+    if adapter == None {
+        return unfreeze(copy_model(model))
+    }
+    return apply_lora(model, adapter)
+}
+
+/// The trained model: adapters merged back, unless `merge` is false.
+fn finish(m, adapter, merge: bool) {
+    if adapter == None || !merge {
+        return m
+    }
+    return merge_lora(m)
+}
+
+// ------------------------------------------------------------------ SFT
+
+/// Supervised fine-tuning: train `model` to produce each example's `response`
+/// after its `prompt` (loss on the response tokens only).
+///
+/// `data` is a list of records with `prompt` and `response` fields, e.g.
+/// `jsonl("train.jsonl", prompt: "instruction", response: "output")`.
+/// `adapter: lora(...)` trains LoRA adapters (merged into the result unless
+/// `merge: false`); without one, every parameter is trained. `format` turns a
+/// prompt into model input (`plain` or `chatml()`); responses end with `stop`
+/// (default: the tokenizer's end-of-text token). The original model is not changed.
+pub fn sft(model, data, adapter = None, tokenizer = None, lr: f64 = 2e-5, epochs: i64 = 1, batch: i64 = 8, max_len: i64 = 512, format = plain, stop: i64 = -1, weight_decay: f64 = 0.0, clip: f64 = 1.0, schedule: str = "constant", warmup: i64 = 0, log_every: i64 = 10, merge: bool = true) {
+    let tok = tokenizer_for(model, tokenizer)
+    let eos = stop_token(tok, stop)
+    let examples = data.map(|ex| completion_tokens(tok, format(field(ex, "prompt")), field(ex, "response"), stop: eos, max_len: max_len))
+    let m = trainable_model(model, adapter)
+    let dev = device_of(m)
+    let params = trainable(m)
+    let opt = AdamW(params, lr: lr, weight_decay: weight_decay, clip: clip)
+    let total = epochs * ((examples.len() + batch - 1) / batch)
+    var step = 0
+    for epoch in 0..epochs {
+        for b in batches(examples, batch, true) {
+            opt.set_lr(lr_at(step, total, lr, schedule: schedule, warmup: warmup))
+            let x = pad(b.map(|e| e.0), value: 0).to(dev)
+            let y = pad(b.map(|e| e.1), value: -100).to(dev)
+            let count = max(1, b.map(|e| e.1.filter(|t| t >= 0).len()).sum())
+            let loss = -token_logprobs(m(x), y).sum() / count as f64
+            opt.step(grad(loss, wrt: params))
+            step += 1
+            if log_every > 0 && (step % log_every == 0 || step == total) {
+                log_line("sft", step, total, "epoch {epoch + 1}, loss {loss.item():.4f}")
+            }
+        }
+    }
+    return finish(m, adapter, merge)
+}
+
+/// The mean loss of `model` on the response tokens of `data` (as in `sft`), without training.
+pub fn sft_loss(model, data, tokenizer = None, batch: i64 = 8, max_len: i64 = 512, format = plain, stop: i64 = -1) -> f64 {
+    let tok = tokenizer_for(model, tokenizer)
+    let eos = stop_token(tok, stop)
+    let examples = data.map(|ex| completion_tokens(tok, format(field(ex, "prompt")), field(ex, "response"), stop: eos, max_len: max_len))
+    let dev = device_of(model)
+    var total = 0.0
+    var count = 0
+    no_grad {
+        for b in batches(examples, batch, false) {
+            let x = pad(b.map(|e| e.0), value: 0).to(dev)
+            let y = pad(b.map(|e| e.1), value: -100).to(dev)
+            total += -token_logprobs(model(x), y).sum().item()
+            count += b.map(|e| e.1.filter(|t| t >= 0).len()).sum()
+        }
+    }
+    return total / max(1, count) as f64
+}
+
+// ------------------------------------------------------------------ DPO
+
+/// log σ(x), computed stably.
+pub fn log_sigmoid(x) {
+    return x.minimum(x * 0.0) - ((-x.abs()).exp() + 1.0).log()
+}
+
+/// Direct preference optimization (Rafailov et al., 2023): raise the
+/// likelihood of each example's `chosen` response over its `rejected` one,
+/// relative to the frozen `reference` model, with strength `beta`.
+///
+/// `data` is a list of records with `prompt`, `chosen`, and `rejected` fields.
+/// `reference` defaults to a frozen copy of `model`. Without `adapter`, every
+/// parameter is trained. Logs the loss, the reward accuracy (how often the
+/// implicit reward prefers `chosen`), and the reward margin.
+pub fn dpo(model, data, reference = None, beta: f64 = 0.1, adapter = None, tokenizer = None, lr: f64 = 5e-6, epochs: i64 = 1, batch: i64 = 4, max_len: i64 = 512, format = plain, stop: i64 = -1, weight_decay: f64 = 0.0, clip: f64 = 1.0, schedule: str = "constant", warmup: i64 = 0, log_every: i64 = 10, merge: bool = true) {
+    let tok = tokenizer_for(model, tokenizer)
+    let eos = stop_token(tok, stop)
+    let ref_model = if reference == None { freeze(model) } else { reference }
+    let pairs = data.map(|ex| {
+        let p = format(field(ex, "prompt"))
+        return (completion_tokens(tok, p, field(ex, "chosen"), stop: eos, max_len: max_len), completion_tokens(tok, p, field(ex, "rejected"), stop: eos, max_len: max_len))
+    })
+    let m = trainable_model(model, adapter)
+    let dev = device_of(m)
+    let params = trainable(m)
+    let opt = AdamW(params, lr: lr, weight_decay: weight_decay, clip: clip)
+    let total = epochs * ((pairs.len() + batch - 1) / batch)
+    var step = 0
+    for epoch in 0..epochs {
+        for b in batches(pairs, batch, true) {
+            opt.set_lr(lr_at(step, total, lr, schedule: schedule, warmup: warmup))
+            let n = b.len()
+            // chosen rows first, then rejected rows, in one batch
+            let rows = b.map(|e| e.0) + b.map(|e| e.1)
+            let x = pad(rows.map(|e| e.0), value: 0).to(dev)
+            let y = pad(rows.map(|e| e.1), value: -100).to(dev)
+            let lp = sequence_logprobs(m, x, y)
+            let ref_lp = no_grad { sequence_logprobs(ref_model, x, y) }
+            let ratio = lp - ref_lp
+            let chosen = ratio[:n]
+            let rejected = ratio[n:]
+            let margin = (chosen - rejected) * beta
+            let loss = -log_sigmoid(margin).mean()
+            opt.step(grad(loss, wrt: params))
+            step += 1
+            if log_every > 0 && (step % log_every == 0 || step == total) {
+                let acc = margin.detach().gt(0.0).to(f32).mean().item()
+                log_line("dpo", step, total, "epoch {epoch + 1}, loss {loss.item():.4f}, reward accuracy {acc:.2f}, margin {margin.detach().mean().item():.4f}")
+            }
+        }
+    }
+    return finish(m, adapter, merge)
+}
+
+/// DPO's statistics for `model` against `reference` on `data` without
+/// training: `{ loss, accuracy, margin }` averaged over the pairs.
+pub fn dpo_eval(model, reference, data, beta: f64 = 0.1, tokenizer = None, batch: i64 = 4, max_len: i64 = 512, format = plain, stop: i64 = -1) {
+    let tok = tokenizer_for(model, tokenizer)
+    let eos = stop_token(tok, stop)
+    let dev = device_of(model)
+    var loss = 0.0
+    var acc = 0.0
+    var margin = 0.0
+    no_grad {
+        for b in data.chunks(max(1, batch)) {
+            let n = b.len()
+            let cs = b.map(|ex| completion_tokens(tok, format(field(ex, "prompt")), field(ex, "chosen"), stop: eos, max_len: max_len))
+            let rs = b.map(|ex| completion_tokens(tok, format(field(ex, "prompt")), field(ex, "rejected"), stop: eos, max_len: max_len))
+            let rows = cs + rs
+            let x = pad(rows.map(|e| e.0), value: 0).to(dev)
+            let y = pad(rows.map(|e| e.1), value: -100).to(dev)
+            let ratio = sequence_logprobs(model, x, y) - sequence_logprobs(reference, x, y)
+            let mg = (ratio[:n] - ratio[n:]) * beta
+            loss += -log_sigmoid(mg).sum().item()
+            acc += mg.gt(0.0).to(f32).sum().item()
+            margin += mg.sum().item()
+        }
+    }
+    let n = max(1, data.len()) as f64
+    return { loss: loss / n, accuracy: acc / n, margin: margin / n }
+}
+
+// ------------------------------------------------------------------ GRPO
+
+/// Group relative policy optimization (Shao et al., 2024): for each prompt,
+/// sample `group` completions, score them with `reward(example, completion)`,
+/// and raise the likelihood of the completions that score above their group's
+/// mean (advantages normalized within the group), with a KL penalty of
+/// strength `beta` towards the frozen `reference` (default: the starting model).
+///
+/// `prompts` is a list of strings or records with a `prompt` field (the whole
+/// record is passed to `reward`, so it can hold an `answer`). Each of the
+/// `steps` updates uses `batch` prompts. Completions end at `stop` (default:
+/// the end-of-text token) or after `max_tokens`. Logs the mean reward.
+/// The model needs a `generate_batch` method (GPT2, Llama, Transformer).
+pub fn grpo(model, prompts, reward, group: i64 = 8, steps: i64 = 100, batch: i64 = 2, max_tokens: i64 = 64, temperature: f64 = 1.0, top_k: i64 = 0, beta: f64 = 0.04, reference = None, adapter = None, tokenizer = None, lr: f64 = 1e-5, format = plain, stop: i64 = -1, weight_decay: f64 = 0.0, clip: f64 = 1.0, log_every: i64 = 10, merge: bool = true, history: bool = false) {
+    let tok = tokenizer_for(model, tokenizer)
+    let eos = stop_token(tok, stop)
+    let ref_model = if reference == None { freeze(model) } else { reference }
+    let m = trainable_model(model, adapter)
+    let dev = device_of(m)
+    let params = trainable(m)
+    let opt = AdamW(params, lr: lr, weight_decay: weight_decay, clip: clip)
+    var order = shuffle(prompts)
+    var next = 0
+    var rewards_log = []
+    for step in 0..steps {
+        var rows = []
+        var advs = []
+        var step_rewards = []
+        for _ in 0..batch {
+            if next >= order.len() {
+                order = shuffle(prompts)
+                next = 0
+            }
+            let ex = order[next]
+            next += 1
+            let ids = tok.encode(format(field(ex, "prompt")))
+            let outs = m.generate_batch(ids, n: group, max_tokens: max_tokens, temperature: temperature, top_k: top_k, stop: eos)
+            let scores = outs.map(|o| reward(ex, tok.decode(o.filter(|t| t != eos))) as f64)
+            let mean = scores.sum() / scores.len() as f64
+            let sd = sqrt(scores.map(|s| (s - mean) * (s - mean)).sum() / scores.len() as f64)
+            for (o, s) in outs.zip(scores) {
+                let seq = ids + o
+                rows.push((seq[:-1], ids[1:].map(|_| -100) + o))
+                advs.push((s - mean) / (sd + 1e-4))
+                step_rewards.push(s)
+            }
+        }
+        let x = pad(rows.map(|e| e.0), value: 0).to(dev)
+        let y = pad(rows.map(|e| e.1), value: -100).to(dev)
+        let mask = (y >= 0).to(f32)
+        let a = tensor.from(advs).to(f32).to(dev).unsqueeze(1)
+        let lp = token_logprobs(m(x), y)
+        var per_token = -(lp * a)
+        if beta > 0.0 {
+            let ref_lp = no_grad { token_logprobs(ref_model(x), y) }
+            let d = ref_lp - lp
+            per_token = per_token + (d.exp() - d - 1.0) * beta
+        }
+        let loss = ((per_token * mask).sum(-1) / mask.sum(-1).clamp(1.0, 1e9)).mean()
+        opt.step(grad(loss, wrt: params))
+        let mean_reward = step_rewards.sum() / step_rewards.len() as f64
+        rewards_log.push(mean_reward)
+        if log_every > 0 && ((step + 1) % log_every == 0 || step + 1 == steps) {
+            log_line("grpo", step + 1, steps, "mean reward {mean_reward:.3f}, loss {loss.item():.4f}")
+        }
+    }
+    let out = finish(m, adapter, merge)
+    return if history { (out, rewards_log) } else { out }
+}
+
+// ------------------------------------------------------------------ distillation
+
+/// Knowledge distillation (Hinton et al., 2015): train `student` to match the
+/// next-token distributions of the frozen `teacher` on `data` (a list of
+/// strings or records with a `text` field), softened by `temperature`; `alpha`
+/// mixes in the ordinary next-token loss (0 = distribution matching only).
+/// Teacher and student must share a tokenizer.
+pub fn distill(student, teacher, data, temperature: f64 = 2.0, alpha: f64 = 0.0, tokenizer = None, lr: f64 = 1e-4, epochs: i64 = 1, batch: i64 = 8, max_len: i64 = 256, weight_decay: f64 = 0.0, clip: f64 = 1.0, log_every: i64 = 10, adapter = None, merge: bool = true) {
+    let tok = tokenizer_for(teacher, tokenizer)
+    let texts = data.map(|ex| if type_of(ex) == "str" { ex } else { field(ex, "text") })
+    let seqs = texts.map(|t| tok.encode(t)).filter(|ids| ids.len() >= 2).map(|ids| if ids.len() > max_len + 1 { ids[:max_len + 1] } else { ids })
+    let m = trainable_model(student, adapter)
+    let dev = device_of(m)
+    let params = trainable(m)
+    let opt = AdamW(params, lr: lr, weight_decay: weight_decay, clip: clip)
+    let total = epochs * ((seqs.len() + batch - 1) / batch)
+    var step = 0
+    for epoch in 0..epochs {
+        for b in batches(seqs, batch, true) {
+            let x = pad(b.map(|s| s[:-1]), value: 0).to(dev)
+            let y = pad(b.map(|s| s[1:]), value: -100).to(dev)
+            let mask = (y >= 0).to(f32)
+            let count = mask.sum()
+            let t_logp = no_grad { log_softmax(teacher(x) / temperature, axis: -1) }
+            let s_logits = m(x)
+            let s_logp = log_softmax(s_logits / temperature, axis: -1)
+            // KL(teacher || student) per position, scaled by T² as in Hinton et al.
+            let kl = (t_logp.exp() * (t_logp - s_logp)).sum(-1)
+            var loss = (kl * mask).sum() / count * (temperature * temperature)
+            if alpha > 0.0 {
+                loss = loss * (1.0 - alpha) + (-token_logprobs(s_logits, y).sum() / count) * alpha
+            }
+            opt.step(grad(loss, wrt: params))
+            step += 1
+            if log_every > 0 && (step % log_every == 0 || step == total) {
+                log_line("distill", step, total, "epoch {epoch + 1}, loss {loss.item():.4f}")
+            }
+        }
+    }
+    return finish(m, adapter, merge)
+}
+
+// ------------------------------------------------------------------ fit + checkpoints
+
+/// A general training loop: for each batch of `data` (a list or stream of
+/// batches), minimize `loss(model, batch)` over the model's trainable
+/// parameters with AdamW (or `optimizer`).
+///
+/// With `checkpoint: "dir"`, the model and optimizer state are saved to `dir`
+/// every `every` steps (and at the end); `resume: true` continues from the
+/// latest checkpoint in `dir`, skipping the steps already done. Returns the
+/// list of losses.
+///
+/// With `gpus: n` (data parallel), the model is copied to GPUs 0 to n-1, each
+/// batch is split into n equal parts along its first dimension, each copy
+/// computes the gradient of its part, the gradients are averaged across the
+/// GPUs (NCCL's all-reduce), and every copy takes the same step, so they stay
+/// identical; the losses are those of the whole batches, as with one GPU. The
+/// model passed in ends with the trained weights.
+pub fn fit(model, data, loss, epochs: i64 = 1, lr: f64 = 1e-3, optimizer = None, weight_decay: f64 = 0.01, clip: f64 = 1.0, schedule: str = "constant", warmup: i64 = 0, log_every: i64 = 10, checkpoint: str = "", every: i64 = 100, resume: bool = false, gpus: i64 = 1, shard_optimizer: bool = false, shard_gradients: bool = false, keep: i64 = 2) -> f64[] {
+    if dist.world() > 1 {
+        return fit_processes(model, data, loss, epochs, lr, optimizer, weight_decay, clip, schedule, warmup, log_every, checkpoint, every, resume, keep)
+    }
+    if gpus > 1 {
+        return fit_parallel(model, data, loss, gpus, epochs, lr, weight_decay, clip, schedule, warmup, log_every, checkpoint, every, resume, shard_optimizer || shard_gradients, shard_gradients)
+    }
+    let params = trainable(model)
+    let opt = if optimizer == None { AdamW(params, lr: lr, weight_decay: weight_decay, clip: clip) } else { optimizer }
+    let items = list(data)
+    let total = epochs * items.len()
+    var start = 0
+    if resume && checkpoint != "" {
+        start = load_checkpoint(model, opt, checkpoint)
+        if start > 0 {
+            print("fit: resuming from step {start} ({checkpoint})")
+        }
+    }
+    var losses = []
+    var step = 0
+    for epoch in 0..epochs {
+        for b in items {
+            if step < start {
+                step += 1
+                continue
+            }
+            if optimizer == None {
+                opt.set_lr(lr_at(step, total, lr, schedule: schedule, warmup: warmup))
+            }
+            let l = loss(model, b)
+            opt.step(grad(l, wrt: params))
+            let v = l.item()
+            losses.push(v)
+            step += 1
+            if log_every > 0 && (step % log_every == 0 || step == total) {
+                log_line("fit", step, total, "epoch {epoch + 1}, loss {v:.4f}")
+            }
+            if checkpoint != "" && every > 0 && step % every == 0 {
+                save_checkpoint(model, opt, checkpoint, step, keep: keep)
+            }
+        }
+    }
+    if checkpoint != "" && step > start {
+        save_checkpoint(model, opt, checkpoint, step, keep: keep)
+    }
+    return losses
+}
+
+/// `fit` in each process of a `zyth launch` run (data parallel across processes and
+/// machines): every process takes its share of each batch (`dist.part`), the gradients are
+/// averaged across the processes (NCCL between NVIDIA GPUs, else TCP), and every copy takes the
+/// same step. The weights start as rank 0's. Rank 0 writes the checkpoints and logs; on resume,
+/// a machine without rank 0's checkpoint gets a copy of it.
+fn fit_processes(model, data, loss, epochs: i64, lr: f64, optimizer, weight_decay: f64, clip: f64, schedule: str, warmup: i64, log_every: i64, checkpoint: str, every: i64, resume: bool, keep: i64) -> f64[] {
+    let params = trainable(model)
+    let me = dist.rank()
+    // the same starting weights everywhere
+    let start_w = dist.broadcast(params)
+    for i in 0..params.len() {
+        params[i].copy_(start_w[i])
+    }
+    let opt = if optimizer == None { AdamW(params, lr: lr, weight_decay: weight_decay, clip: clip) } else { optimizer }
+    let items = list(data)
+    let total = epochs * items.len()
+    var start = 0
+    if resume && checkpoint != "" {
+        let at = dist.broadcast(if me == 0 { ckpt_latest(checkpoint) } else { "" })
+        if at != "" {
+            let _ = dist.share_dir(at)
+            let state = must(json.parse(must(fs.read("{at}/state.json"), "checkpoint {at}")), "checkpoint {at}/state.json")
+            must(model.load_weights("{at}/model.zyth.model"), "checkpoint {at}")
+            must(opt.load_state("{at}/optimizer.safetensors"), "checkpoint {at}")
+            restore_rng(state)
+            start = state["step"]
+            if me == 0 {
+                print("fit: resuming from step {start} ({checkpoint}, {dist.world()} processes)")
+            }
+        }
+    }
+    var losses = []
+    var step = 0
+    for epoch in 0..epochs {
+        for b in items {
+            if step < start {
+                step += 1
+                continue
+            }
+            if optimizer == None {
+                opt.set_lr(lr_at(step, total, lr, schedule: schedule, warmup: warmup))
+            }
+            let (piece, w) = dist.part(b)
+            let l = loss(model, piece)
+            let gs = grad(l, wrt: params)
+            // the gradients and the loss in one exchange
+            var all = gs
+            all.push(l.detach())
+            let avg = dist.average(all, weight: w)
+            opt.step(avg[:gs.len()])
+            let v = avg[gs.len()].item()
+            losses.push(v)
+            step += 1
+            if me == 0 && log_every > 0 && (step % log_every == 0 || step == total) {
+                log_line("fit", step, total, "epoch {epoch + 1}, loss {v:.4f} ({dist.world()} processes)")
+            }
+            if me == 0 && checkpoint != "" && every > 0 && step % every == 0 {
+                save_checkpoint(model, opt, checkpoint, step, keep: keep)
+            }
+        }
+    }
+    if me == 0 && checkpoint != "" && step > start {
+        save_checkpoint(model, opt, checkpoint, step, keep: keep)
+    }
+    return losses
+}
+
+/// `fit(..., gpus: n)`: data-parallel training (see `fit`).
+fn fit_parallel(model, data, loss, gpus: i64, epochs: i64, lr: f64, weight_decay: f64, clip: f64, schedule: str, warmup: i64, log_every: i64, checkpoint: str, every: i64, resume: bool, shard_optimizer: bool, shard_gradients: bool) -> f64[] {
+    // replica 0 is the model itself (moved to GPU 0); the others are copies
+    var replicas = [replicate(model, 0)]
+    for i in 1..gpus {
+        replicas.push(replicate(model, i))
+    }
+    let params = replicas.map(|r| trainable(r))
+    // `shard_optimizer` (ZeRO stage 1): each GPU keeps the optimizer state (AdamW's two moments)
+    // of the parameters it owns only, updates those, and sends them to the others
+    let owner = if shard_optimizer { partition(params[0], gpus) } else { params[0].map(|p| 0) }
+    var owned = []
+    for i in 0..gpus {
+        var mine = []
+        for j in 0..owner.len() {
+            if !shard_optimizer || owner[j] == i {
+                mine.push(j)
+            }
+        }
+        owned.push(mine)
+    }
+    // (a sharded optimizer sees part of the gradient: the clipping by the whole gradient's norm
+    // is done here, before the parts are handed out)
+    var opts = []
+    for i in 0..gpus {
+        let mine = owned[i].map(|j| params[i][j])
+        opts.push(AdamW(mine, lr: lr, weight_decay: weight_decay, clip: if shard_optimizer { 0.0 } else { clip }))
+    }
+    let items = list(data)
+    let total = epochs * items.len()
+    // the copies are identical: a checkpoint is copy 0 and its optimizer (with a sharded
+    // optimizer, every GPU's part: optimizer-<i>.safetensors); resuming loads it into all
+    var start = 0
+    if resume && checkpoint != "" {
+        for i in 0..gpus {
+            start = load_checkpoint(replicas[i], opts[i], checkpoint, part: if shard_optimizer { i } else { -1 })
+        }
+        if start > 0 {
+            print("fit: resuming from step {start} ({checkpoint}, {gpus} GPUs)")
+        }
+    }
+    var losses = []
+    var step = 0
+    for epoch in 0..epochs {
+        for b in items {
+            if step < start {
+                step += 1
+                continue
+            }
+            for o in opts {
+                o.set_lr(lr_at(step, total, lr, schedule: schedule, warmup: warmup))
+            }
+            let parts = split_batch(b, gpus)
+            var grads = []
+            var parts_loss = []
+            for i in 0..gpus {
+                let l = loss(replicas[i], parts[i])
+                grads.push(grad(l, wrt: params[i]))
+                parts_loss.push(l)
+            }
+            // `shard_gradients` (ZeRO stage 2): each mean is made on its owner's GPU only, and the
+            // GPUs' own gradients are let go at once
+            var avg = if shard_gradients { average_grads(grads, owner: owner) } else { average_grads(grads) }
+            grads = []
+            if shard_gradients && clip > 0.0 {
+                // clipped by the norm of the whole gradient, made of every GPU's part
+                var whole = []
+                for j in 0..owner.len() {
+                    whole.push(avg[owner[j]][j])
+                }
+                let clipped = clip_grad_norm(whole, clip)
+                for j in 0..owner.len() {
+                    avg[owner[j]][j] = clipped[j]
+                }
+            } else if shard_optimizer && clip > 0.0 {
+                avg = avg.map(|g| clip_grad_norm(g, clip))
+            }
+            for i in 0..gpus {
+                opts[i].step(owned[i].map(|j| avg[i][j]))
+            }
+            if shard_optimizer {
+                share_owned(params, owner)
+            }
+            var v = 0.0
+            for l in parts_loss {
+                v += l.item()
+            }
+            v = v / gpus
+            losses.push(v)
+            step += 1
+            if log_every > 0 && (step % log_every == 0 || step == total) {
+                log_line("fit", step, total, "epoch {epoch + 1}, loss {v:.4f} ({gpus} GPUs)")
+            }
+            if checkpoint != "" && every > 0 && step % every == 0 {
+                save_parallel(replicas, opts, checkpoint, step, shard_optimizer)
+            }
+        }
+    }
+    if checkpoint != "" && step > start {
+        save_parallel(replicas, opts, checkpoint, step, shard_optimizer)
+    }
+    copy_weights(replicas[0], model)
+    return losses
+}
+
+fn must(r, what: str) {
+    return match r {
+        Ok(v)  => v
+        Err(e) => panic("{what}: {e}")
+        other  => other
+    }
+}
+
+/// Save `model` (weights only) and the optimizer state as step `step` in `dir`.
+fn save_parallel(replicas, opts, dir: str, step: i64, sharded: bool) {
+    let tmp = must(ckpt_begin(dir, step), "checkpoint {dir}")
+    write_parts(tmp, [replicas[0]], [opts[0]], step, "model.zyth.model", "optimizer.safetensors")
+    if sharded {
+        // every GPU's part at the same time
+        var paths: str[] = []
+        for i in 0..opts.len() {
+            paths.push("{tmp}/optimizer-{i}.safetensors")
+        }
+        must(save_states(opts, paths), "checkpoint {dir}")
+    }
+    must(ckpt_commit(dir, step, 2), "checkpoint {dir}")
+}
+
+// the files of one checkpoint: models[k] and opts[k] (one each, or one per layer or stage),
+// then state.json with the step and the random generator (written last: a checkpoint is
+// complete when it has state.json)
+fn write_parts(tmp: str, models, opts, step: i64, model_file: str, opt_file: str) {
+    for k in 0..models.len() {
+        let mf = if model_file != "" { model_file } else { "layer-{k}.zyth.model" }
+        let of = if opt_file != "" { opt_file } else { "optimizer-{k}.safetensors" }
+        must(models[k].save("{tmp}/{mf}"), "checkpoint {tmp}")
+        must(opts[k].save_state("{tmp}/{of}"), "checkpoint {tmp}")
+    }
+    must(fs.write("{tmp}/state.json", json.stringify({ step: step, rng: rng_state() })), "checkpoint {tmp}")
+}
+
+/// Save `model` and `opt` as step `step` in `dir`, so that a crash at any moment leaves the
+/// previous checkpoint or this one (written beside the others, then renamed into place); the
+/// newest `keep` are kept.
+pub fn save_checkpoint(model, opt, dir: str, step: i64, keep: i64 = 2) {
+    must(fs.mkdir(dir), "checkpoint {dir}")
+    let tmp = must(ckpt_begin(dir, step), "checkpoint {dir}")
+    write_parts(tmp, [model], [opt], step, "model.zyth.model", "optimizer.safetensors")
+    must(ckpt_commit(dir, step, keep), "checkpoint {dir}")
+}
+
+/// Load the latest checkpoint in `dir` into `model` and `opt`; returns its step (0 if there is
+/// none). The random generator continues where it was.
+pub fn load_checkpoint(model, opt, dir: str, part: i64 = -1) -> i64 {
+    let at = ckpt_latest(dir)
+    if at == "" {
+        return 0
+    }
+    let state = must(json.parse(must(fs.read("{at}/state.json"), "checkpoint {at}")), "checkpoint {at}/state.json")
+    must(model.load_weights("{at}/model.zyth.model"), "checkpoint {at}")
+    let opt_file = if part >= 0 { "{at}/optimizer-{part}.safetensors" } else { "{at}/optimizer.safetensors" }
+    must(opt.load_state(opt_file), "checkpoint {at}")
+    restore_rng(state)
+    return state["step"]
+}
+
+fn restore_rng(state) {
+    let r = state.get("rng")
+    if r != None {
+        set_rng_state(r.unwrap())
+    }
+}
+
+// a list of layers or stages and their optimizers (fit_sharded, fit_pipeline)
+fn save_layers(models, opts, dir: str, step: i64, keep: i64) {
+    must(fs.mkdir(dir), "checkpoint {dir}")
+    let tmp = must(ckpt_begin(dir, step), "checkpoint {dir}")
+    write_parts(tmp, models, opts, step, "", "")
+    must(ckpt_commit(dir, step, keep), "checkpoint {dir}")
+}
+
+fn load_layers(models, opts, dir: str) -> i64 {
+    let at = ckpt_latest(dir)
+    if at == "" {
+        return 0
+    }
+    let state = must(json.parse(must(fs.read("{at}/state.json"), "checkpoint {at}")), "checkpoint {at}/state.json")
+    for k in 0..models.len() {
+        must(models[k].load_weights("{at}/layer-{k}.zyth.model"), "checkpoint {at}")
+        must(opts[k].load_state("{at}/optimizer-{k}.safetensors"), "checkpoint {at}")
+    }
+    restore_rng(state)
+    return state["step"]
+}
+
+// ------------------------------------------------------------------ fit_sharded (ZeRO stage 3)
+
+/// Data-parallel training of `layers` (models run one after another: `x |> layers[0] |> ...`)
+/// on `gpus` GPUs, with every layer's weights, gradients and optimizer state on one GPU only
+/// (its owner, the layers balanced by size), so a model larger than one GPU's memory trains
+/// (ZeRO stage 3 / FSDP, by layer). Each batch is `(x, target)`, split between the GPUs;
+/// `loss(out, target)` gives each GPU's loss, and the step uses their mean. A layer's weights
+/// are copied to the other GPUs when it runs and let go after; the backward pass runs each
+/// layer again from the input it was given (activation checkpointing), so only the layers'
+/// inputs are kept. Returns the mean loss of each step. Layers created on the CPU are moved
+/// to their owners without ever being on one GPU together.
+pub fn fit_sharded(layers, data, loss, gpus: i64 = 2, epochs: i64 = 1, lr: f64 = 1e-3, weight_decay: f64 = 0.01, clip: f64 = 1.0, schedule: str = "constant", warmup: i64 = 0, log_every: i64 = 10, checkpoint: str = "", every: i64 = 100, resume: bool = false, keep: i64 = 2) -> f64[] {
+    let n = max(gpus, 1)
+    let count = layers.len()
+    // owners: the largest layers first, each to the GPU holding the least so far
+    let sizes = layers.map(|l| trainable(l).map(|p| p.numel()).sum())
+    var order = (0..count).to_list()
+    order.sort_by_key(|k| -sizes[k])
+    var load = (0..n).map(|_| 0)
+    var owner = (0..count).map(|_| 0)
+    for k in order {
+        var best = 0
+        for i in 1..n {
+            if load[i] < load[best] { best = i }
+        }
+        owner[k] = best
+        load[best] += sizes[k]
+    }
+    var placed = []
+    for k in 0..count {
+        placed.push(replicate(layers[k], owner[k]))
+    }
+    let opts = placed.map(|l| AdamW(trainable(l), lr: lr, weight_decay: weight_decay, clip: 0.0))
+    let items = list(data)
+    let total = epochs * items.len()
+    let start = if resume && checkpoint != "" { load_layers(placed, opts, checkpoint) } else { 0 }
+    if start > 0 {
+        print("fit_sharded: resuming from step {start} ({checkpoint})")
+    }
+    var losses = []
+    var step = 0
+    for epoch in 0..epochs {
+        for b in items {
+            if step < start {
+                step += 1
+                continue
+            }
+            for o in opts {
+                o.set_lr(lr_at(step, total, lr, schedule: schedule, warmup: warmup))
+            }
+            let parts = split_batch(b, n)
+            // forward without a tape, keeping each layer's input on each GPU
+            var acts = []
+            var h = parts.map(|p| p[0])
+            no_grad {
+                for k in 0..count {
+                    acts.push(h)
+                    var next = []
+                    for i in 0..n {
+                        let here = if owner[k] == i { placed[k] } else { replicate(placed[k], i, fp8: true) }
+                        next.push(here(h[i]))
+                    }
+                    h = next
+                }
+            }
+            // each GPU's loss and its gradient at the last layer's output
+            var g = []
+            var v = 0.0
+            for i in 0..n {
+                let out = h[i].requires_grad_()
+                let l = loss(out, parts[i][1])
+                v += l.item()
+                g.push(grad(l, wrt: [out])[0])
+            }
+            v = v / n
+            h = []
+            // backward, layer by layer from the last: run the layer again with a tape, take the
+            // gradients for its weights (averaged onto the owner) and for its input
+            var layer_grads = (0..count).map(|_| [])
+            var k = count - 1
+            while k >= 0 {
+                var per = []
+                var gin = []
+                for i in 0..n {
+                    let here = if owner[k] == i { placed[k] } else { replicate(placed[k], i, fp8: true) }
+                    let ps = trainable(here)
+                    let x = if k > 0 { acts[k][i].requires_grad_() } else { acts[k][i] }
+                    let y = here(x)
+                    let wrt = if k > 0 { ps + [x] } else { ps }
+                    let gs = grad((y * g[i]).sum(), wrt: wrt)
+                    per.push(gs[:ps.len()])
+                    if k > 0 { gin.push(gs[ps.len()]) }
+                }
+                let avg = average_grads(per, owner: per[0].map(|_| owner[k]))
+                layer_grads[k] = avg[owner[k]]
+                acts[k] = []
+                g = gin
+                k -= 1
+            }
+            // clipped by the norm of the whole gradient (every layer's, on its owner)
+            if clip > 0.0 {
+                var whole = []
+                for k2 in 0..count {
+                    whole.extend(layer_grads[k2])
+                }
+                let clipped = clip_grad_norm(whole, clip)
+                var at = 0
+                for k2 in 0..count {
+                    let m = layer_grads[k2].len()
+                    layer_grads[k2] = clipped[at:at + m]
+                    at += m
+                }
+            }
+            for k2 in 0..count {
+                opts[k2].step(layer_grads[k2])
+            }
+            losses.push(v)
+            step += 1
+            if log_every > 0 && (step % log_every == 0 || step == total) {
+                log_line("fit_sharded", step, total, "epoch {epoch + 1}, loss {v:.4f} ({n} GPUs, weights sharded)")
+            }
+            if checkpoint != "" && every > 0 && step % every == 0 {
+                save_layers(placed, opts, checkpoint, step, keep)
+            }
+        }
+    }
+    if checkpoint != "" && step > start {
+        save_layers(placed, opts, checkpoint, step, keep)
+    }
+    // the trained weights back into the caller's layers, where they live
+    for k in 0..count {
+        copy_weights(placed[k], layers[k])
+    }
+    return losses
+}
+
+// ------------------------------------------------------------------ fit_pipeline
+
+/// Training with the model split into `stages` (models run one after another), stage s on GPU s
+/// (pipeline parallelism, GPipe's schedule): each batch `(x, target)` is cut into `micro`
+/// micro-batches that go through the stages in turn, the activations moving from GPU to GPU;
+/// the step uses the mean of the micro-batches' `loss(out, target)` (computed on the last
+/// stage's GPU), so the result is that of the whole batch. Every stage's weights and optimizer
+/// state stay on its GPU. Returns the loss of each step.
+///
+/// `order: "1f1b"` (the default, as Megatron and PipeDream-Flush) runs a micro-batch's
+/// backward pass as soon as `stages` micro-batches are in flight, so at most that many keep
+/// their activations, however many micro-batches there are; `"gpipe"` runs every forward pass
+/// first, then one backward pass for all. Both give the same gradients (up to rounding).
+pub fn fit_pipeline(stages, data, loss, micro: i64 = 4, epochs: i64 = 1, lr: f64 = 1e-3, weight_decay: f64 = 0.01, clip: f64 = 1.0, schedule: str = "constant", warmup: i64 = 0, log_every: i64 = 10, checkpoint: str = "", every: i64 = 100, resume: bool = false, keep: i64 = 2, order: str = "1f1b") -> f64[] {
+    if order != "1f1b" && order != "gpipe" {
+        panic("fit_pipeline: order is \"1f1b\" or \"gpipe\", not \"{order}\"")
+    }
+    let count = stages.len()
+    var placed = []
+    for s in 0..count {
+        placed.push(replicate(stages[s], s))
+    }
+    let params = placed.map(|st| trainable(st))
+    let opts = params.map(|ps| AdamW(ps, lr: lr, weight_decay: weight_decay, clip: 0.0))
+    let items = list(data)
+    let total = epochs * items.len()
+    let start = if resume && checkpoint != "" { load_layers(placed, opts, checkpoint) } else { 0 }
+    if start > 0 {
+        print("fit_pipeline: resuming from step {start} ({checkpoint})")
+    }
+    var losses = []
+    var step = 0
+    for epoch in 0..epochs {
+        for b in items {
+            if step < start {
+                step += 1
+                continue
+            }
+            for o in opts {
+                o.set_lr(lr_at(step, total, lr, schedule: schedule, warmup: warmup))
+            }
+            // the micro-batches (split_batch puts piece i on GPU i: they are moved where needed)
+            let parts = split_batch(b, micro)
+            var all = []
+            for ps in params {
+                all.extend(ps)
+            }
+            var sum = None
+            var gs = []
+            if order == "gpipe" {
+                for mb in parts {
+                    var h = mb[0]
+                    for s in 0..count {
+                        h = placed[s](h.to(gpu(s)))
+                    }
+                    let l = loss(h, mb[1].to(gpu(count - 1)))
+                    sum = match sum {
+                        Some(t) => Some(t + l)
+                        None => Some(l)
+                    }
+                }
+                gs = grad(sum.unwrap() / micro, wrt: all)
+            } else {
+                // 1F1B: a backward pass as soon as `count` micro-batches are in flight; the
+                // gradients add up (each micro-batch's loss counts 1/micro, as in the mean)
+                var flight = []
+                var acc = None
+                for i in 0..parts.len() + count {
+                    if i < parts.len() {
+                        let mb = parts[i]
+                        var h = mb[0]
+                        for s in 0..count {
+                            h = placed[s](h.to(gpu(s)))
+                        }
+                        flight.push(loss(h, mb[1].to(gpu(count - 1))))
+                    }
+                    if flight.len() > 0 && (flight.len() >= count || i >= parts.len()) {
+                        let l = flight[0]
+                        flight = flight[1:]
+                        let g = grad(l / micro, wrt: all)
+                        acc = match acc {
+                            Some(a) => Some((0..a.len()).map(|j| a[j] + g[j]))
+                            None => Some(g)
+                        }
+                        sum = match sum {
+                            Some(t) => Some(t + l.detach())
+                            None => Some(l.detach())
+                        }
+                    }
+                }
+                gs = acc.unwrap()
+            }
+            let mean = sum.unwrap() / micro
+            if clip > 0.0 {
+                gs = clip_grad_norm(gs, clip)
+            }
+            var at = 0
+            for s in 0..count {
+                let m = params[s].len()
+                opts[s].step(gs[at:at + m])
+                at += m
+            }
+            let v = mean.item()
+            losses.push(v)
+            step += 1
+            if log_every > 0 && (step % log_every == 0 || step == total) {
+                log_line("fit_pipeline", step, total, "epoch {epoch + 1}, loss {v:.4f} ({count} stages, {micro} micro-batches)")
+            }
+            if checkpoint != "" && every > 0 && step % every == 0 {
+                save_layers(placed, opts, checkpoint, step, keep)
+            }
+        }
+    }
+    if checkpoint != "" && step > start {
+        save_layers(placed, opts, checkpoint, step, keep)
+    }
+    for s in 0..count {
+        copy_weights(placed[s], stages[s])
+    }
+    return losses
+}

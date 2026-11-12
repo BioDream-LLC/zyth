@@ -1,0 +1,19 @@
+// A page that trains a tiny model in the browser (WebAssembly; WebGPU when the
+// browser has it):  zyth build --target web 08_web.zyth -o web08  and serve web08/.
+use zyth.optim.SGD
+
+let xs = tensor.linspace(-2.0, 2.0, 64).reshape(64, 1)
+let ys = (xs * 3.0 - 1.0) + tensor.randn(64, 1) * 0.1
+model Line {
+    l = Linear(1 -> 1)
+    fn forward(self, x) = self.l(x)
+}
+let m = Line()
+let opt = SGD(m.params, lr: 0.1)
+for step in 0..200 {
+    let loss = mse(m(xs), ys)
+    opt.step(grad(loss, wrt: m.params))
+}
+let w = m.l.w.item()
+let b = m.l.b.unwrap().item()
+print("learned w={w:.2f} b={b:.2f}")

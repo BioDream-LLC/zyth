@@ -1,0 +1,134 @@
+// FlashAttention (forward, causal, head size 64) written in Zyth: attention computed tile by
+// tile in the GPU's shared memory, never storing the T x T score matrix, with the running
+// max and sum of the online softmax. On NVIDIA it compiles to CUDA C; its 45 KB of shared
+// memory is more than the 16 KB WebGPU promises, so browsers need smaller tiles.
+
+kernel fn flash(q: tensor<f32>, k: tensor<f32>, v: tensor<f32>, out: mut tensor<f32>, t: i64, scale: f32) {
+    // a block: 64 query rows, 128 threads as 16 x 8; each thread works on 8 rows (ty * 8 + i)
+    // and, of the 32 keys of a tile, keys tx and tx + 16; of the 64 dimensions, tx + 16 * c
+    var qs = shared(f32, 4160)          // 64 x 64 queries (rows padded to 65)
+    var ks = shared(f32, 2080)          // 32 x 64 keys
+    var vs = shared(f32, 2048)          // 32 x 64 values
+    var ps = shared(f32, 2112)          // 64 x 32 weights (padded to 33)
+    var pm = shared(f32, 1024)          // 64 x 16 partial row maxima
+    var sc = local(f32, 16)             // 8 rows x 2 keys of scores
+    var mx = local(f32, 8)              // running max and sum of the 8 rows
+    var sm = local(f32, 8)
+    var acc = local(f32, 32)            // 8 rows x 4 dimensions of the output
+    let tx = thread.x
+    let ty = thread.y
+    let tid = ty * 16 + tx
+    let r0 = block.x * 64
+    let base = block.y * t * 64
+    for u in 0..32 {
+        let e = tid + 128 * u           // 4096 query values, 32 per thread
+        let rr = e / 64
+        qs[rr * 65 + e % 64] = if r0 + rr < t { q[base + (r0 + rr) * 64 + e % 64] * scale } else { 0.0 }
+    }
+    for i in 0..8 { mx[i] = -1e30 }
+    var kt = 0
+    while kt < r0 + 64 && kt < t {
+        for u in 0..16 {
+            let e = tid + 128 * u       // 2048 key and value entries, 16 per thread
+            let kr = e / 64
+            let ok = kt + kr < t
+            ks[kr * 65 + e % 64] = if ok { k[base + (kt + kr) * 64 + e % 64] } else { 0.0 }
+            vs[e] = if ok { v[base + (kt + kr) * 64 + e % 64] } else { 0.0 }
+        }
+        sync()
+        // scores: 8 rows x 2 keys, 16 products for 10 shared reads
+        for x in 0..16 { sc[x] = 0.0 }
+        for e in 0..64 {
+            let k0 = ks[tx * 65 + e]
+            let k1 = ks[(tx + 16) * 65 + e]
+            for i in 0..8 {
+                let qv = qs[(ty * 8 + i) * 65 + e]
+                sc[i * 2] += qv * k0
+                sc[i * 2 + 1] += qv * k1
+            }
+        }
+        for i in 0..8 {
+            let row = r0 + ty * 8 + i
+            var m2 = -1e30
+            for c in 0..2 {
+                let key = kt + tx + 16 * c
+                if key > row || key >= t { sc[i * 2 + c] = -1e30 }
+                m2 = max(m2, sc[i * 2 + c])
+            }
+            pm[(ty * 8 + i) * 16 + tx] = m2
+        }
+        sync()
+        // each row's new max, the weights, and the old sums and outputs rescaled
+        for i in 0..8 {
+            var nm = mx[i]
+            for w in 0..16 { nm = max(nm, pm[(ty * 8 + i) * 16 + w]) }
+            let corr = exp(mx[i] - nm)
+            sm[i] = sm[i] * corr
+            for c in 0..4 { acc[i * 4 + c] = acc[i * 4 + c] * corr }
+            mx[i] = nm
+            for c in 0..2 { ps[(ty * 8 + i) * 33 + tx + 16 * c] = exp(sc[i * 2 + c] - nm) }
+        }
+        sync()
+        // weights times values: 32 products for 12 shared reads
+        for c in 0..32 {
+            let v0 = vs[c * 64 + tx]
+            let v1 = vs[c * 64 + tx + 16]
+            let v2 = vs[c * 64 + tx + 32]
+            let v3 = vs[c * 64 + tx + 48]
+            for i in 0..8 {
+                let p = ps[(ty * 8 + i) * 33 + c]
+                sm[i] += p
+                acc[i * 4] += p * v0
+                acc[i * 4 + 1] += p * v1
+                acc[i * 4 + 2] += p * v2
+                acc[i * 4 + 3] += p * v3
+            }
+        }
+        sync()
+        kt += 32
+    }
+    for i in 0..8 {
+        let row = r0 + ty * 8 + i
+        if row < t {
+            for c in 0..4 { out[base + row * 64 + tx + 16 * c] = acc[i * 4 + c] / sm[i] }
+        }
+    }
+}
+
+// [B * H, T, D] heads; compared with the same attention from built-in operations
+fn reference(q: tensor<f32>, k: tensor<f32>, v: tensor<f32>, t: i64, scale: f32) -> tensor<f32> {
+    let s = (q @ k.transpose(1, 2)) * scale
+    let mask = tensor.ones([t, t]).tril()
+    let p = softmax(s.masked_fill(mask == 0.0, -1e30), axis: -1)
+    p @ v
+}
+
+let (bh, t, d) = (8 * 12, 1024, 64)
+seed(1)
+let q = tensor.randn([bh, t, d]).gpu()
+let k = tensor.randn([bh, t, d]).gpu()
+let v = tensor.randn([bh, t, d]).gpu()
+var out = tensor.zeros([bh, t, d]).gpu()
+let scale = 1.0 / sqrt(d as f64)
+let grid = ((t + 63) / 64, bh)
+flash.launch(q, k, v, out, t, scale, grid: grid, block: (16, 8))
+let want = reference(q, k, v, t, scale)
+print("max difference from built-in operations:", (out - want).abs().max().item())
+flash.launch(q, k, v, out, t, scale, grid: grid, block: (16, 8), checked: false)
+let _ = out.sum().item()
+let reps = 10
+var t0 = clock()
+// (the first launch above checked every index; the timed ones run without the checks)
+for r in 0..reps { flash.launch(q, k, v, out, t, scale, grid: grid, block: (16, 8), checked: false) }
+let _ = out.sum().item()
+let tf = (clock() - t0) / reps as f64
+t0 = clock()
+for r in 0..reps {
+    let w = reference(q, k, v, t, scale)
+    let _ = w[0, 0, 0].item()
+}
+let tr = (clock() - t0) / reps as f64
+// causal attention: about half of 4 * B*H * T * T * D operations
+let flops = 2.0 * bh * t * t * d
+print("flash_attention (Zyth kernel fn): {round(tf * 1000.0, 2)} ms, {round(flops / tf / 1e12, 2)} TFLOP/s")
+print("built-in operations (cuBLAS + softmax): {round(tr * 1000.0, 2)} ms")

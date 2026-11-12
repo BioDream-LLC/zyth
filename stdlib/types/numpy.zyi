@@ -1,0 +1,10 @@
+/// First-party type definitions for NumPy (spec Section 14.6).
+/// NumPy arrays are typed as CPU tensors so shapes are checked across calls.
+declare module python.numpy {
+    type ndarray<T, S> = tensor<T, S> on cpu
+
+    fn matmul<T, M, K, N>(a: ndarray<T, [M, K]>, b: ndarray<T, [K, N]>) -> ndarray<T, [M, N]>
+    fn outer<T, M, N>(a: ndarray<T, [M]>, b: ndarray<T, [N]>) -> ndarray<T, [M, N]>
+    fn transpose<T, M, N>(a: ndarray<T, [M, N]>) -> ndarray<T, [N, M]>
+    fn eye(n: i64) -> ndarray<f64, [n, n]>
+}

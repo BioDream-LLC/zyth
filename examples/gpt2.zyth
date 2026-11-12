@@ -1,0 +1,10 @@
+// Run OpenAI's pretrained GPT-2 (124M parameters) on the CPU.
+// The first run downloads ~550 MB from the Hugging Face Hub into ~/.cache/zyth/hub.
+let tok = hub.tokenizer("gpt2")
+let model = hub.load("gpt2")
+print("GPT-2 with {model.param_count()} parameters")
+
+seed(7)
+let prompt = "The most important thing about programming languages is"
+let ids = model.generate(tok.encode(prompt), max_tokens: 40, temperature: 0.8, top_k: 40)
+print(tok.decode(ids))

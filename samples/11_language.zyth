@@ -1,0 +1,44 @@
+// Everyday Zyth: structs, enums with payloads, traits, pattern matching,
+// Result and `?`, closures, and collections.
+enum Shape {
+    Circle(r: f64)
+    Rect(w: f64, h: f64)
+}
+
+trait Area {
+    fn area(self) -> f64
+    fn describe(self) -> str = "area {self.area():.2f}"
+}
+
+impl Area for Shape {
+    fn area(self) -> f64 = match self {
+        Shape.Circle(r) => PI * r * r
+        Shape.Rect(w, h) => w * h
+    }
+}
+
+fn parse_shape(s: str) -> Result<Shape, str> {
+    let parts = s.split(" ")
+    return match parts[0] {
+        "circle" => Ok(Shape.Circle(parts[1].parse_float()?))
+        "rect" => Ok(Shape.Rect(parts[1].parse_float()?, parts[2].parse_float()?))
+        other => Err("unknown shape `{other}`")
+    }
+}
+
+fn total_area(lines: str[]) -> Result<f64, str> {
+    var sum = 0.0
+    for l in lines {
+        sum += parse_shape(l)?.area()
+    }
+    return Ok(sum)
+}
+
+let shapes = ["circle 1", "rect 2 3", "circle 0.5"].map(|s| parse_shape(s).unwrap())
+for s in shapes { print(s, "->", s.describe()) }
+print("total:", total_area(["circle 1", "rect 2 3"]))
+print("bad:", total_area(["rect 2 3", "hexagon 4"]))
+let by_kind = shapes.map(|s| match s { Shape.Circle(_) => "circle", _ => "rect" })
+var counts = {}
+for k in by_kind { counts[k] = counts.get(k).unwrap_or(0) + 1 }
+print(counts)

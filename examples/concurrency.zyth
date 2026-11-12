@@ -1,0 +1,25 @@
+// Structured concurrency: tasks belong to scopes, failures cancel siblings.
+fn fetch(i: i64) -> i64 {
+    sleep(0.05)
+    return i * 100
+}
+
+let results = scope {
+    let tasks = (0..4).map(|i| go { fetch(i) })
+    tasks.map(|t| t.join())
+}
+print(results)
+
+// A producer/consumer pair over a bounded channel.
+let ch = channel(capacity: 4)
+go {
+    for i in 0..10 { ch.send(i) }
+    ch.close()
+}
+var total = 0
+for v in ch { total += v }
+print("total {total}")
+
+// Each loop iteration runs on the CPU thread pool.
+let squares = parallel for i in 0..8 { i * i }
+print(squares)

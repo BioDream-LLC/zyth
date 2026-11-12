@@ -1,0 +1,56 @@
+/// What `zyth check` knows, for libraries (module `zyth.check`).
+///
+/// A library adds its own warnings with `@lint`: a function that `zyth check` and `zyth lint`
+/// call for every call of one of the library's functions in the program, with what the checker
+/// knows about that call. It returns a message (a warning at that call) or `None`.
+///
+///     use zyth.check.{lint, Call}
+///
+///     /// A query inside a loop runs once per item.
+///     @lint(calls: "query")
+///     fn query_in_loop(c: Call) -> ?str {
+///         if c.in_loop { return Some("query inside a loop (line {c.loop_line}): use `include`") }
+///         return None
+///     }
+///
+/// A lint runs while the program is checked, never while it runs: it may not read files, use
+/// the network or do anything else outside the program (`zyth check` refuses one that does,
+/// E0112), and it is stopped after 2 seconds.
+///
+/// A function asks which fields of what it returns the caller reads by marking a parameter
+/// `@fields_used`: `zyth run` fills it with those fields (sorted), or leaves the default
+/// (`None`) when the checker cannot tell (the value is passed on, returned, or printed whole).
+///
+///     fn find(table: str, @fields_used fields: ?[str] = None) -> [Row] { ... }
+///
+///     for r in find("users") { print(r.name) }    // fields is Some(["name"])
+
+/// One call of a library function, as the checker sees it.
+pub struct Call {
+    /// The function called, as declared (`query`, or `Db.query` for a method).
+    name: str,
+    /// Where: the file, its line and column.
+    file: str,
+    line: i64,
+    col: i64,
+    /// The function or method the call is in (`Shop.list` for a method), "" at the top level.
+    in_fn: str,
+    /// Inside a loop of that function: `for`, `while`, `loop`, or a closure given to a list's
+    /// `map`, `filter`, `for_each` and the like.
+    in_loop: bool,
+    /// The line of the innermost such loop (0 when there is none).
+    loop_line: i64,
+    /// The arguments as written, in order (named ones as `name: text`).
+    args: [str],
+    /// The fields the caller reads from the result (`None` when the checker cannot tell).
+    fields: ?[str],
+}
+
+/// Marks a function as a library warning, run by `zyth check` and `zyth lint` for every call
+/// of `calls` (a function of the same module, or `Type.method`). The function takes a `Call`
+/// and returns `?str`; the warning is reported as W0111 with the lint's name.
+pub annotation lint(calls: str) on fn
+
+/// Marks a parameter of type `?[str]` that `zyth run` fills with the fields the caller reads
+/// from the function's result, when the caller leaves it out.
+pub annotation fields_used on param

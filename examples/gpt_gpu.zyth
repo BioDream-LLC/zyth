@@ -1,0 +1,18 @@
+// The spec's flagship demo (Section 20.1), verbatim except for the data path.
+// Needs an NVIDIA GPU (without one it runs on the CPU, very slowly); the GPT-2
+// tokenizer is downloaded from the Hugging Face Hub on first use.
+use zyth.nn.Transformer
+use zyth.data.text
+use zyth.optim.AdamW
+
+let tok = text.tokenizer("gpt2")
+let data = text.stream("data/tinyshakespeare.txt", tokenizer: tok, context: 256).batch(32)
+let model = Transformer(layers: 6, heads: 6, dim: 384, vocab: tok.vocab_size, context: 256) on gpu
+let opt = AdamW(model.params, lr: 3e-4)
+
+for (step, batch) in data.take(5000).enumerate() {
+    let loss = model(batch.x) |> cross_entropy(batch.y)
+    opt.step(grad(loss, wrt: model.params))
+    if step % 500 == 0 { print("step {step}: loss {loss:.3f}") }
+}
+model.save("tiny-gpt.zyth.model")

@@ -1,0 +1,51 @@
+// A small CNN on MNIST (GPU if available). Download the four MNIST files into this directory first:
+// for f in train-images-idx3-ubyte train-labels-idx1-ubyte t10k-images-idx3-ubyte t10k-labels-idx1-ubyte; do
+//   curl -L https://ossci-datasets.s3.amazonaws.com/mnist/$f.gz | gunzip > data/$f; done
+
+use zyth.nn.{Conv2d, MaxPool2d, Linear}
+use zyth.optim.AdamW
+
+model Net {
+    c1 = Conv2d(1 -> 32, kernel: 3, padding: 1)
+    c2 = Conv2d(32 -> 64, kernel: 3, padding: 1)
+    pool = MaxPool2d(2)
+    fc1 = Linear(64 * 7 * 7 -> 128)
+    fc2 = Linear(128 -> 10)
+
+    fn forward(self, x: tensor<f32, [B, 1, 28, 28]>) -> tensor<f32, [B, 10]> {
+        let h = self.pool(relu(self.c1(x)))
+        let h = self.pool(relu(self.c2(h)))
+        return self.fc2(relu(self.fc1(h.flatten(1))))
+    }
+}
+
+fn images(path: str, n: i64) = (tensor.from_file(path, dtype: u8, offset: 16, shape: [n, 1, 28, 28], device: gpu).to(f32) / 255.0 - 0.1307) / 0.3081
+fn labels(path: str, n: i64) = tensor.from_file(path, dtype: u8, offset: 8, device: gpu).to(i64)
+
+let xtr = images("data/train-images-idx3-ubyte", 60000)
+let ytr = labels("data/train-labels-idx1-ubyte", 60000)
+let xte = images("data/t10k-images-idx3-ubyte", 10000)
+let yte = labels("data/t10k-labels-idx1-ubyte", 10000)
+
+let net = Net().to(gpu)
+let opt = AdamW(net.params, lr: 1e-3)
+let bs = 128
+let t0 = clock()
+for epoch in 0..2 {
+    let perm = tensor.randperm(60000)
+    for i in 0..(60000 / bs) {
+        let idx = perm[i * bs..(i + 1) * bs].to(gpu)
+        let loss = net(xtr[idx]) |> cross_entropy(ytr[idx])
+        opt.step(grad(loss, wrt: net.params))
+        if i % 100 == 0 { print("epoch {epoch} step {i}: loss {loss.item():.3f}") }
+    }
+}
+let train_s = clock() - t0
+var correct = 0
+no_grad {
+    for i in 0..10 {
+        let pred = net(xte[i * 1000..(i + 1) * 1000]).argmax(axis: -1)
+        correct += (pred == yte[i * 1000..(i + 1) * 1000]).to(i64).sum().item() as i64
+    }
+}
+print("test accuracy {correct as f64 / 100.0:.2f}% after 2 epochs, training took {train_s:.1f} s on {xtr.device}")

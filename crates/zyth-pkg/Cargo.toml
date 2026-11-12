@@ -1,0 +1,15 @@
+[package]
+name = "zyth-pkg"
+version.workspace = true
+license = "Apache-2.0 OR MIT"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Zyth's package tools: the checksum log (server, client checks, auditor and witness), the package registry, and package content hashes"
+
+[dependencies]
+serde_json = "1"
+# the checksum log: Ed25519 tree heads and SHA-256 trees
+ring = "=0.17.14"
+sha2 = "=0.10.9"

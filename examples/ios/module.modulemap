@@ -1,0 +1,5 @@
+module Zyth {
+    header "zyth.h"
+    link "zyth_native"
+    export *
+}

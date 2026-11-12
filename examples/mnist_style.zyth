@@ -1,0 +1,36 @@
+// A classifier on synthetic data with a validation split, accuracy, and checkpointing.
+use zyth.optim.AdamW
+seed(1)
+
+model Classifier {
+    fc1 = Linear(64 -> 128)
+    fc2 = Linear(128 -> 10)
+
+    fn forward(self, x: tensor<f32, [B, 64]>) -> tensor<f32, [B, 10]> {
+        return x |> self.fc1 |> relu |> self.fc2
+    }
+}
+
+// Ten noisy prototype "digits".
+let prototypes = tensor.randn(10, 64)
+fn make_batch(n: i64, protos) {
+    let labels = (tensor.rand(n) * 10.0).floor().to(i64)
+    let x = protos[labels] + tensor.randn(n, 64) * 0.8
+    return (x, labels)
+}
+
+let model = Classifier()
+let opt = AdamW(model.params, lr: 1e-3)
+for step in 0..300 {
+    let (x, y) = make_batch(64, prototypes)
+    let loss = model(x) |> cross_entropy(y)
+    opt.step(grad(loss, wrt: model.params))
+    if step % 100 == 0 { print("step {step}: loss {loss:.4f}") }
+}
+
+let (vx, vy) = make_batch(1000, prototypes)
+let acc = no_grad { (model(vx).argmax(axis: -1) == vy).to(f32).mean().item() }
+print("validation accuracy {acc:.3f}")
+model.save("classifier.zyth.model")
+let reloaded = Classifier.load("classifier.zyth.model")?
+print("reloaded: {reloaded.param_count()} parameters")

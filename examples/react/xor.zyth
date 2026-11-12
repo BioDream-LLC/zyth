@@ -1,0 +1,64 @@
+// A React component that trains a neural network in the browser. The component compiles to
+// JavaScript; `train` and `predictions` use tensors, so they run in WebAssembly in the same
+// package (zyth build --target npm-jsx xor.zyth -o xor), and the component calls them from an
+// event handler and from `use_async`.
+use zyth.react.{div, h2, button, p, ul, li, use_state, use_async, Element}
+use zyth.optim.AdamW
+
+seed(7)
+
+model MLPNet(hidden: i64) {
+    fc1 = Linear(2 -> hidden)
+    fc2 = Linear(hidden -> 2)
+
+    fn forward(self, x: tensor<f32, [B, 2]>) -> tensor<f32, [B, 2]> {
+        return x |> self.fc1 |> relu |> self.fc2
+    }
+}
+
+let data = tensor.from([[0.0, 0.0], [0.0, 1.0], [1.0, 0.0], [1.0, 1.0]])
+let labels = tensor.from([0, 1, 1, 0])
+let net = MLPNet(16)
+let opt = AdamW(net.params, lr: 0.05, weight_decay: 0.0)
+
+/// Train `steps` more steps; the loss after the last one.
+@export
+fn train(steps: i64) -> f64 {
+    var loss = 0.0
+    for _ in 0..steps {
+        let l = net(data) |> cross_entropy(labels)
+        opt.step(grad(l, wrt: net.params))
+        loss = l.item()
+    }
+    return loss
+}
+
+/// The network's answers for 00, 01, 10 and 11.
+@export
+fn predictions() -> str = "{net(data).argmax(axis: -1).tolist()}"
+
+fn param_count() -> i64 = net.param_count()
+
+/// Trains XOR in the browser, `steps` steps per click.
+@export
+fn XorTrainer(steps: i64 = 50) -> Element {
+    let none: f64[] = []
+    let (losses, set_losses) = use_state(none)
+    let (answers, set_answers) = use_state("not trained yet")
+    let params = use_async(|| param_count(), deps: [])
+    return div(class: "xor") {
+        h2 { "XOR, trained in your browser" }
+        p(class: "params") { if params == None { "loading the model..." } else { "{params ?? 0} parameters" } }
+        button(on_click: || {
+            let loss = train(steps)
+            set_losses(losses + [loss])
+            set_answers(predictions())
+        }) { "train {steps} steps" }
+        ul {
+            for (i, loss) in losses.enumerate() {
+                li { "after {(i + 1) * steps} steps: loss {loss:.4}" }
+            }
+        }
+        p(class: "answers") { "answers for 00, 01, 10, 11: {answers}" }
+    }
+}

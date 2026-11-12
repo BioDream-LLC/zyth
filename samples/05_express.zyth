@@ -1,0 +1,27 @@
+// An Express web server whose routes are Zyth closures (Node.js compatibility, M13).
+//   zyth add npm:express      (once)
+//   zyth run 05_express.zyth  and open http://localhost:3000
+// The server runs until a request to /stop closes it.
+use npm.express
+
+let app = express()
+var visits = 0
+app.use(express.json())
+app.get("/", |req, res| {
+    visits += 1
+    res.send("<h1>Hello from Zyth</h1><p>visit {visits}</p>")
+})
+app.get("/square/:n", |req, res| {
+    let n = req.params.n.parse_float() ?? 0.0
+    res.json({ n: n, square: n * n })
+})
+app.post("/stats", |req, res| {
+    let xs = req.body.values
+    res.json({ count: xs.len(), mean: xs.sum() / xs.len() as f64, max: xs.max() })
+})
+var server = None
+app.get("/stop", |req, res| {
+    res.send("bye")
+    server?.close()
+})
+server = Some(app.listen(3000, || print("listening on http://localhost:3000")))

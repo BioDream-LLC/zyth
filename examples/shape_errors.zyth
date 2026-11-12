@@ -1,0 +1,19 @@
+// Shape bugs are caught before the program runs:
+//
+//   zyth check examples/shape_errors.zyth
+//
+// reports E0406 at the `self.fc2` call with the provenance of 512 and 256
+// and suggests `Linear(512 -> 10)`. Remove the `// ` on line 13 to see it.
+model Classifier {
+    fc1 = Linear(784 -> 512)
+    fc2 = Linear(512 -> 10)
+
+    fn forward(self, x: tensor<f32, [B, 784]>) -> tensor<f32, [B, 10]> {
+        return x |> self.fc1 |> relu |> self.fc2
+    }
+}
+// let broken = Linear(256 -> 10)(tensor.randn(32, 512))
+
+let model = Classifier()
+let logits = model(tensor.randn(32, 784))
+print(logits.shape)

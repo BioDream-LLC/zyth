@@ -1,0 +1,135 @@
+# Zyth — compact reference for language models
+
+Zyth is a statically checked language for AI work. Syntax is close to Rust/Swift with braces and no semicolons. Tensor shapes are checked before running.
+
+## Basics
+- `let x = 1`, `var y = 2.0` (changes), `const N = 10`; a `let` the code changes later is a `var`. `a, b = b, a` swaps. Newline ends a statement.
+- Integers default to i64, float literals to f32. No implicit numeric conversion between named values: `x as f32`.
+- Arithmetic: integers divide to a whole number (`7 / 2` is 3, truncating toward zero); `a // b` rounds down (Python); `// words` is a comment. `%` keeps the sign of the left side (`-1 % 3` is -1); `a.mod(n)` wraps (`(-1).mod(3)` is 2). `**` is power. `&&`, `||`, `!` (also `and`, `or`, `not`); `x in xs` / `x not in xs`.
+- Functions: `fn add(a: f32, b: f32 = 1.0) -> f32 { return a + b }` or `fn sq(x: f32) -> f32 = x * x`. Call with positional or named args: `add(1.0, b: 2.0)`.
+- A function changes its caller's variable only through a `mut` parameter: `fn bump(c: mut Counter) { c.n += 1 }`, called `bump(c)` with `var c` (or `bump(mut borrow c)`). Without `mut`, lists, maps and structs are copies, and what the function changes in them is lost (warning W0109).
+- Closures: `|x| x * 2`, `{ x -> x * 2 }`. Trailing block: `f(args) { x -> ... }`.
+- Pipe: `x |> f(a)` means `f(x, a)`. Bitwise on integers: `&`, `|`, `^`, `<<`, `>>`, `~x`.
+- Strings: `"loss {loss:.4f}"` interpolation with format specs; `"""..."""` multi-line; literal braces `{{ }}`.
+- Control flow: `if c { } else { }` (also an expression), `match v { 0 => .., 1..=9 => .., Some(x) if x > 0 => .., _ => .. }`, `for i in 0..n {}`, `for (i, x) in xs.enumerate() {}`, `while`, `loop { break v }`. Generators: a `fn` that uses `yield x` returns a lazy `stream<T>` (`fn evens() -> stream<i64> { var i = 0  loop { yield i  i += 2 } }`, then `for x in evens().take(5) {}` or `.collect()`); `return` without a value ends it; no `yield` inside closures.
+- Strings: `s.split()` splits on any whitespace (like Python), `s.split(",")` on a separator (`max: 1` limits the splits), `s.split_once("=")` gives `?(str, str)`, `s.lines()`, `s.trim()`, `s.len()`, `s.contains(x)`, `s.starts_with(x)`, `s.replace(a, b)`, `s.upper()`, `s.lower()`, `s.find(x)` gives `?i64`, `s.chars()`, `xs.join(", ")`, `s.reverse()`, `s[1:3]`. A character is a one-character string: `s[0]`, `'a'` and the items of `s.chars()` are `str`, with `c.is_digit()`, `c.is_alpha()`, `c.is_alphanumeric()`, `c.is_upper()`, `c.is_whitespace()`; `ord(c)` / `chr(n)` convert codes. Numbers from text: `s.parse_int()` / `s.parse_float()` give a `Result` (use `?`, `.unwrap()`, or `?? 0`); `"42" as i64` converts text that is surely a number; `str(n)` the other way.
+- Lists: `xs.map(|x| ..)`, `xs.filter(|x| ..)`, `xs.sum()`, `xs.len()`, `xs.sorted()`, `xs.sorted_by(|x| key)` or `xs.sorted_by(|a, b| a - b)` (`reverse: true` for descending), `a.cmp(b)` gives -1/0/1, `xs.max_by(|x| key)`, `xs.min_by(|x| key)`, closures unpack: `m.items().map(|(k, v)| ..)`, `xs.enumerate()`, `xs.zip(ys)`, `xs.take(n)`, `xs[1:3]`. Changing in place: `xs.push(x)`, `xs.pop()`, `xs.insert(i, x)`, `xs.sort()`, `xs.sort_by(|a, b| ..)`, `xs.reverse()`, `xs.pop_front()`; `sorted`/`reversed`/`map`/`filter` return new lists. `[0] * n` or `[0; n]` repeats. No comprehensions. Maps: `var m = {}`, `m[k] = v`, `m.get(k) ?? 0` or `m[k] ?? 0`, `m.contains(k)`, `m.items()` gives `(key, value)` tuples, `t.0`/`t.1` for tuple fields. `round(x, 2)`, `str(x)`, `len(xs)` also work.
+- Collections: lists `[1, 2]` (`xs.push(3)` needs `var`), maps `{"a": 1}`, records `{ name: "x" }` (string-keyed maps, `r.name`), sets `set([1, 2])`, tuples `(1, "a")`.
+- Types: `struct P { x: f32, y: f32 = 0.0 }`, `enum E { A, B(v: f32) }`, `trait T { fn f(self) -> i64; fn g(self) = 1 }`, `impl T for P { ... }`, `impl P { fn new() -> P = P { x: 0.0 } }`. Methods take `self` or `mut self`.
+- Errors: `Result<T, E>`, `Ok(v)`, `Err(e)`, `?T` optionals with `Some(v)`/`None`, `x?` propagates (in a function returning a plain value it stops with the error), `a ?? b` default (tighter than `==`, looser than `+`: write `(m.get(k) ?? 0) + 1`). No exceptions; `panic("msg")`. These give optionals: `xs.pop()`, `xs.get(i)`, `xs.first()`, `xs.last()`, `m.get(k)`, `s.find(x)`; `xs.pop() == 3` compares the value; in arithmetic, `as`, an index or `let (a, b) = ...` an optional is unwrapped (stops if None).
+- Speed: `zyth run --aot f.zyth` compiles functions to machine code with the same results; `--aot-report` shows what still runs in the interpreter and why. `zyth build --aot f.zyth` makes one executable (with `zyth-rt`, the runtime without the tools, when it is next to `zyth`).
+- Work in a loop: write the file, `zyth fix f.zyth` (applies the checker's fix edits), `zyth check --json f.zyth` until it is clean, then `zyth run` / `zyth test`. Tools: `zyth check --json f.zyth` (errors with fix edits), `zyth fix f.zyth` (apply them), `zyth query type f.zyth:12:5`, `zyth query uses f.zyth:3:4`, `zyth query impact f.zyth --edit 3:10-3:13 "str"` (what an edit breaks, before making it). The MCP server (`zyth mcp`) has the same as tools: check, type_at, find_uses, edit_impact, fix, run_tests.
+- Contracts: `fn f(xs: f64[]) -> f64 requires xs.len() > 0 ensures result >= 0.0 { ... }` (each on its own line before `{` is fine). `zyth test` calls every function with contracts on 100 generated inputs and prints the smallest failing call, so writing `requires`/`ensures` gives you tests for free.
+- Effects: a header may say what the function does besides computing: `fn load(p: str) -> str uses files, fails { ... }`. Effects: `net`, `files`, `gpu`, `ai` (decide/ai; limits per call: `ai(dollars: 0.01, decisions: 2)`), `process`, `ffi`, `fails` (panic, assert, `.unwrap()`, `.expect()`); `uses nothing` for none. A function with a `uses` clause is checked: calling something with an effect it does not list is E0230, and the fix adds it. Functions without a clause are not checked; `zyth fix --effects f.zyth` writes all clauses.
+- Parameters can be reassigned inside a function (the caller's value does not change). Common Rust and Python spellings are accepted and mean the same thing: `Shape::Circle`, `&x`, `Vec<T>`, `String`, `usize`, `HashMap::new()`, `vec![..]`, `.iter()`, `.collect()`, `.to_lowercase()`, `.powf()`.
+- Modules: `use zyth.nn.Transformer`, `use zyth.optim.{AdamW, SGD}`, `use zyth.data.text`, `use python.numpy as np`, `use npm.marked`.
+
+## Mistakes that make Zyth programs fail (from AI models' first tries)
+- Indexing past the end stops the program (E0411): `xs[0]` on an empty list. Check `xs.len() > 0` first, or use `xs.first() ?? default`, `xs.get(i) ?? default`.
+- `.unwrap()` on `None` or `Err` stops it: prefer `?? default`, `if let v = opt { }`, or `match`.
+- `%` keeps the sign (`-1 % 26` is -1): for wrap-around (rotations, Caesar shifts) use `x.mod(n)`. `x as u8` wraps past 255: do character arithmetic in i64 with `ord(c)` and `chr(n)`.
+- `a ?? b + 1` is an error: write `(a ?? b) + 1` (counting: `m[k] = (m.get(k) ?? 0) + 1`, or `m[k] = m[k] ?? 0` then `m[k] += 1`).
+- Lists, maps and structs are values: `let p = xs[0]` then `p.x = 1` changes only `p`; write `xs[0].x = 1`. (A `for` loop variable changed in place is stored back.)
+- The result must have the declared type: `x.argmax(axis: 1)` is `tensor<i64, [N]>` (`.tolist()` for `i64[]`); `keep: true` keeps a dimension of size 1 (`[N, 1]`, not `[N]`).
+- Names that do not exist: `zyth.datetime`, `zyth.nn.functional` (the NN functions are in the prelude: `softmax(x, axis: -1)`), `tensor.scatter` (use `x.scatter_add`), regular expressions (`replace` and `split` take plain text).
+- Priority queue: `var pq = PriorityQueue.new()` (smallest first), `pq.push((dist, node))`, `pq.pop()` gives `?T`; `BinaryHeap::new()` is largest first (`Reverse(x)`). Items: numbers, text, tuples, or structs with a `cmp` method. Queue: a list with `push` and `pop_front()`.
+- Text: `"*" * n` repeats; `s[i]` and the items of `s.chars()` are one-character strings; `xs.join("")` makes text from them.
+
+Worked examples (each runs as written):
+```zyth
+fn tag_counts(posts: str[]) -> (str, i64)[] {
+    var counts: map<str, i64> = {}
+    for p in posts {
+        for w in p.split() {
+            if w.starts_with("#") && w.len() > 1 {
+                let tag = w[1:].lower()
+                counts[tag] = (counts.get(tag) ?? 0) + 1
+            }
+        }
+    }
+    return counts.items().sorted_by(|a, b| if a.1 != b.1 { b.1 - a.1 } else { a.0.cmp(b.0) })
+}
+
+fn run_in_priority(jobs: (str, i64)[]) -> str[] {
+    var pq = PriorityQueue.new()
+    for (name, prio) in jobs { pq.push((prio, name)) }
+    var order: str[] = []
+    while let (_, name) = pq.pop() { order.push(name) }
+    return order
+}
+
+fn top_class_prob(logits: tensor<f32, [N, C]>) -> f32[] {
+    let e = (logits - logits.max(axis: -1, keep: true)).exp()
+    let p = e / e.sum(axis: -1, keep: true)
+    return p.max(axis: -1).tolist()
+}
+```
+
+## Tensors
+- Type: `tensor<f32, [B, 784]> on gpu`. Dims: literal `784`, symbolic `B` (bound per call), runtime `_`, leading `...`.
+- Create: `tensor.zeros(2, 3)`, `tensor.randn(784, 256)`, `tensor.ones(n)`, `tensor.arange(10)`, `tensor.from([[1, 2], [3, 4]])`, `tensor<f32, [3, 4]>.randn()`, `tensor<f32>([[1, 2]])`.
+- Ops: `+ - * / **` element-wise with NumPy broadcasting, `@` matmul, `x.T`, `x.reshape(2, -1)`, `x.transpose(0, 1)`, `x.sum(axis: -1, keep: true)`, `mean std max min argmax`, `x[0, 1:3]`, `x[ids]` (row lookup), `concat([a, b], axis: 0)`, `stack`, `softmax(x, axis: -1)`, `relu gelu silu sigmoid tanh exp log sqrt`, `layer_norm`, `attention(qkv, heads: 4, causal: true)` (packed `[B, T, 3D]` -> `[B, T, D]`, fused on the CPU), `x.linear(w, bias: b)` (`x @ w + b` in one step), `cross_entropy(logits, targets)`, `mse`, `x.to(f16)`, `x.to(gpu)`, `x.item()`, `x.tolist()`.
+- Errors before running: E0401 matmul mismatch, E0402 dtype, E0403 device, E0404 broadcast, E0405 reshape size, E0406 declared type mismatch, E0408 axis, E0409 concat, E0410 grad of non-scalar.
+
+## Autodiff and models
+- `let g = grad(loss, wrt: model.params)` (alias `∇`). `no_grad { ... }`. `t.param()` makes a trainable leaf. `grad(..., create_graph: true)` for second order.
+- Models: `model Net { fc1 = Linear(784 -> 256)  fc2 = Linear(256 -> 10)  fn forward(self, x: tensor<f32, [B, 784]>) -> tensor<f32, [B, 10]> { return x |> self.fc1 |> relu |> self.fc2 } }`. Constructor params: `model Block(dim: i64) { ... }`. Call `m(x)`. `m.params`, `m.param_count()`, `m.save("m.zyth.model")`, `Net.load("m.zyth.model")?`, `m on gpu`.
+- Layers (prelude): `Linear(in -> out, bias: true)`, `Embedding(vocab -> dim)`, `LayerNorm(dim)`, `RMSNorm(dim)`, `Dropout(p)`, `MLP(dim, hidden)`; `zyth.nn`: `MultiHeadAttention(dim, heads)`, `TransformerBlock(dim, heads)`, `Transformer(layers:, heads:, dim:, vocab:, context:)` with `.generate(ids, max_tokens:)`.
+- Optimizers (`zyth.optim`): `AdamW(params, lr: 3e-4, weight_decay: 0.01)`, `Adam`, `SGD(params, lr:, momentum:)`, `Lion`; `opt.step(grads)`.
+- Data (`zyth.data`): `text.tokenizer("char")`, `text.stream(path, tokenizer:, context:).batch(n)` yields `{x, y}`; streams support `.take(n) .enumerate() .map(f) .batch(n)`.
+- Testing: `@test fn name() { assert_close(a, b, tol: 1e-5); assert_shape(t, [2, 3]); gradcheck(f, inputs: [x]) }`, run with `zyth test`.
+
+## Decision points (AI inside a program)
+- `decide "question" from x { label => expr, label "description" => expr, unsure => expr }` — an AI picks one listed answer; at least two answers; `unsure` runs when the decider cannot tell. `approve label => ...` needs a person's OK first (requires an `unsure` answer, which runs if they say no).
+- `let v: T = ai "instruction" from x` (or `ai "..." from x as T`) — an AI fills in a T: str (default), ints, floats, bool, `?T` (None when unsure), `T[]`, `map<str, T>`, tuples, structs and field-less enums of those. Never tensors or functions (E0811).
+- Deciders are values: `ai.local("Qwen/Qwen2.5-3B-Instruct", device: gpu)`, `ai.cloud("openrouter:meta-llama/llama-3.3-70b-instruct")` (key in `OPENROUTER_API_KEY` or `~/.config/zyth/openrouter.key`; also `"bedrock:MODEL"`, `"anthropic:MODEL"`, `"openai:MODEL"`, `url:` for Ollama/vLLM), `ai.rules(|req| "label")` (plain code; `req.input`, `req.question`, `req.choices`, `req.kind`; return a label, a value, `None`, or `ai.answer(x, confidence: 0.9, why: "...")`), `ai.human()`, `ai.scripted(["a", "b"])` (tests), `ai.first([a, b], below: 0.7)` (escalate when unsure), `ai.remember(d)`, `ai.review(d)` (a person may correct; corrections go to the diary).
+- Choose the decider: `decider d` (rest of the program), `using d { ... }` (a block), `decide "..." using d { }` (one decision), or `zyth run --decider SPEC` (replaces `decider d`).
+- More deciders: `ai.verified(proposer, check)` (the check `|req, answer|` returns true, or false/a reason to reject; the proposer is asked again without the rejected answer), `ai.argue(|req| {arguments: [...], attacks: [(a, b)], choices: {label: argument}}, semantics: "grounded"|"preferred"|"stable")` (picks the answer whose argument holds; also usable as the check of `ai.verified`), `ai.cheaper(main, cheap, after: 20, agree: 0.95)` (switches to the cheap decider where it agrees with the main one).
+- One decision's budget: `decide "..." from x using d within(dollars: 0.001, seconds: 2) { ... }` (an expensive decider over budget is not asked; a late answer counts as unsure). `zyth diary run.jsonl` suggests code for decisions that always give the same answer or follow a simple rule.
+- `ai.limits(decisions: 100, seconds: 60, dollars: 0.5)`; `ai.decisions()`, `ai.spent()`. `zyth run --diary run.jsonl` records every decision; `--replay run.jsonl` repeats them exactly; `--approve all|none`. `zyth compare app.zyth --decider A --decider B` shows where two deciders differ.
+- `let c = ai.chat("Qwen/Qwen2.5-3B-Instruct", system: "...")` then `c.say("hi")` (keeps the conversation's memory between turns).
+- Fast local models: `ai.local(name, device: gpu, format: "q4_0")` (f16 default, q8_0, q4_0; also on the CPU). Direct use: `let e = llm.engine(hub.load(name), format: "q8_0", device: gpu)`, `e.generate(ids, max_tokens: 128, temperature: 0.0)`, `e.logits(ids)`. `m.generate(...)` on a Llama model uses it automatically.
+- Teach a local model: `let taught = ai.teach(ai.local("Qwen/Qwen2.5-0.5B-Instruct"), ai.lessons("run.jsonl"), epochs: 4)` learns the decisions in a diary; `taught.model().save("mine.zyth.model")`; later `ai.local("mine.zyth.model", tokenizer: "Qwen/Qwen2.5-0.5B-Instruct")`. Command line: `zyth teach --from-diary run.jsonl --model M -o mine.zyth.model`, or `zyth teach notes/ --model M --writer openrouter:MODEL` to learn a folder of notes.
+- `zyth make "a to-do app" -o todo.zyth --decider SPEC` writes a program; `zyth convert prog.py --decider SPEC` rewrites Python or JavaScript in Zyth (it must print the same output); `zyth remix URL` copies a shared app's source to change it.
+- Example:
+```zyth
+struct Event { title: str, day: str, place: ?str }
+decider ai.cloud("openrouter:meta-llama/llama-3.3-70b-instruct")
+var counts = { "work": 0, "personal": 0 }
+for subject in ["Budget review Tuesday", "Dinner Sunday?"] {
+    let group = decide "Is this email work or personal?" from subject {
+        work "about a job or business" => "work"
+        personal => "personal"
+        unsure => "personal"
+    }
+    counts[group] += 1
+}
+print(counts)
+let events: Event[] = ai "List the appointments in this text" from "Lunch with Ann on Friday at the cafe"
+for e in events { print("{e.title} on {e.day}") }
+```
+Answers are labels (not strings) and each answer is followed by `=>` and one expression or a `{ block }` on the same line.
+
+## Drawing (zyth.gfx)
+- `use zyth.gfx`; `let s = gfx.window(title: "x", width: 800, height: 600)` (a canvas on the web) or `gfx.surface(width:, height:)` off screen; `let sh = gfx.shader(r"""...WGSL...""")` (raw string: braces stay); `let p = s.pipeline(sh, vertex: "vs", fragment: "fs", buffers: [["f32x2", "f32x3"]], topology: "triangles", depth: true)`; `let b = gfx.buffer([...])`, `b.write([...])`; `s.run { f -> f.draw(p, vertices: [b], bind: [uniforms]) }` each frame (`f.time`, `f.events`, `f.aspect`, `f.stop()`), `s.frame { f -> ... }` once, `s.save("out.png")`, `s.read()`. Text: `f.text("score {n}", x: 10, y: 10, size: 24, color: [1, 1, 1])` (pixels from the top left; `font: gfx.font("f.ttf")`; `gfx.text_size(t, size:)` gives (w, h)). Right-to-left and joined scripts are shaped (with a font that has them). Smooth edges: `gfx.window(..., samples: 4)`. Render to texture: bind another surface (`bind: [s2, gfx.sampler()]`) to sample its last frame. A `gpu` tensor `[N, k]` can be the vertices directly. 3D scenes: the `scene3d` package (`Scene`, `cube`, `sphere`, `Orbit`).
+
+## Interop
+- Python: `use python.numpy as np` (dynamic `pyobject` values; `.zyi` files with `declare module python.X { fn ... }` add types). npm: `use npm.lodash as _` after `zyth add npm:lodash`. Zyth packages: `use geom` after `zyth add git:github.com/someone/geom` (installed in `.zyth/pkg/`; a package's code may only do what its `allow` in zyth.toml grants, else E0235). Before importing a package you have not seen in the project, run `zyth vet npm:<name>` (models often name packages that do not exist); `zyth doc --deps` shows the installed packages' API at their versions.
+- C: `extern "C" from "m" { fn cos(x: f64) -> f64  fn getenv(n: ptr<u8>) -> ?ptr<u8> }`; calls only inside `danger { }`; strings pass as `ptr<u8>`; `str.from_c(p)` reads a C string.
+- GPU: `x.to(gpu)`, `Model(...) on gpu`, `tensor.randn(2, 3, device: gpu)`; NVIDIA via CUDA, CPU fallback elsewhere.
+
+## Concurrency
+- MCP server: `use zyth.mcp`, mark functions `@tool` (doc comment = description, `- param: text` lines describe parameters, types = schema), `@resource("notes://{id}")`, `@prompt`; then `mcp.serve(name: "x")` (stdio) or `mcp.serve(http: 8080)`. Return `Err("why")` for a tool error. `print` goes to stderr in servers. MCP client: `use mcp."npx -y some-server" as s` then `s.tool_name(arg: v)`, `s.tools()`, `s.read(uri)`.
+- Agents: `use zyth.agent`; `let a = agent.new(model: "openrouter:openai/gpt-4o-mini", instructions: "...", tools: [my_fn, some_mcp_server, other_agent], max_steps: 10, approve: [risky_fn], output: MyStruct)`; tools are named `fn`s with doc comments. `let r = a.run("task")` gives `r.text`, `r.value`, `r.ok`, `r.steps`, `r.dollars`; `a.ask("task")` gives just the answer. `a.serve(port: 9000)` offers it over A2A; `agent.remote("http://host:9000").ask("...")` calls one.
+- Run AI-written code safely: `use zyth.sandbox`; `let r = sandbox.run(code, allow: ["fs:read:./data"], seconds: 5)`; `r.ok`, `r.output`, `r.errors` (each with `message`, `line`, `fixes`); as an agent tool: `tools: [sandbox.tool()]`.
+- Tensors, more: `einsum("bij,bjk->bik", a, b)`; `x.gather(1, idx)`, `x.scatter_add(1, idx, src)`, `x.index_add(ids, rows)`; sparse: `tensor.sparse_coo(indices, values, shape: [m, n])`, `s @ dense`, `s.to_dense()`; low precision: `x.to(fp8_e4m3)` (`f8`), `fp8_e5m2`, `int4`, `int8`, `x.quantize(int4, block: 32)` then `x @ q`; `vmap(f)(batch)`, `jacobian(f, x)`, `hessian(f, x)`, `@checkpoint fn block(...)`; sharded: `x.shard(gpus(8), axis: 0)`, type `tensor<f32, [B, D]> on gpus(8) shard [B, _]`, `xs.map_shards(|p| model(p))`, `xs.gather()`.
+- GPU kernels: `kernel fn add(x: tensor<f32>, y: tensor<f32>, out: mut tensor<f32>) { let i = thread.global  if i < out.len() { out[i] = x[i] + y[i] } }` then `add.launch(x, y, out, threads: n)`; inside: numbers only, `x[i]`, `thread.x`, `block.x`, `block_dim.x`, `var s = shared(f32, 256)`, `sync()`, `atomic_add(out, 0, v)`, `exp`/`sqrt`/`min`/`max`.
+- `go { ... }` starts a task; `t.join()`. `scope { ... }` waits for its tasks; a failure cancels siblings. `scope(timeout: 5.seconds) { }`.
+- `channel(capacity: 8)`: `ch.send(v)`, `for v in ch {}`, `ch.close()`. `parallel for x in xs { ... }` returns a list. `pipeline { a: src  b: a |> f }`.
+
+## Tooling
+CNNs: `conv2d(x, w, bias:, stride:, padding: n | "same", dilation:, groups:)`, `conv1d`, `max_pool2d(x, k, stride:, padding:)`, `avg_pool2d`; layers `Conv2d(3 -> 16, kernel: 3, padding: 1)`, `Conv1d`, `MaxPool2d(2)`, `AvgPool2d(2)` in `zyth.nn`. Data: `tensor.from_file(path, dtype: u8, offset: 16, shape: [n, 28, 28])`, `tensor.randperm(n)`.
+
+Model I/O: `hub.load("gpt2")`; `import.safetensors(p, arch: M)` (without `arch:`, a map of name → tensor); `import.gguf(p, arch: M)`; `import.onnx(p, device: gpu)` returns a callable (`m(x)`, `.inputs`, `.outputs`, `.ops()`, `.to(gpu)`); `model.export("m.safetensors" | "m.gguf" (quant: q8_0|q4_0|q4_k) | "m.onnx" (input: x, dynamic: true|false|["T"]))`.
+
+`zyth run f.zyth`, `zyth check --json f.zyth` (diagnostics with machine-applicable `fixes`), `zyth explain E0401`, `zyth test`, `zyth build f.zyth -o app` (`--target web` static site, `--target npm` package / `--target python` wheel of `@export` items), `zyth add npm:pkg` / `git:repo` / `py:pkg`, `zyth install`, `zyth update`, `zyth vet npm:pkg`, `zyth api` / `zyth bump` / `zyth publish` (package versions from API changes), `zyth repl`, `zyth fmt`, `zyth profile f.zyth --steps 20` (per-line CPU/GPU time, suggestions), `zyth bench` (`@bench fn`), `zyth lint` (danger/FFI/detach sites, `--json`), `zyth types status`, `zyth audit` (OSV advisories), `zyth notebook f.zyth` (cells = `// %%` sections), `zyth jupyter install` (Jupyter kernel), `zyth lsp`, `zyth mcp` (MCP server with tools check, infer_shapes, run_tests, explain, search_docs, check_package, package_docs, and more).

@@ -1,0 +1,17 @@
+// Python libraries from Zyth (spec Section 14.2). Needs a build with Python support:
+//   cargo build --release --features python
+//   zyth run examples/python_interop.zyth
+use python.math
+use python.numpy as np
+use python.statistics.{mean, stdev}
+
+print("math.sqrt(2) = {math.sqrt(2.0)}")
+let a = np.arange(6).reshape(2, 3)
+print("numpy says the sum is {a.sum()} and the shape is {a.shape}")
+
+// NumPy arrays convert to tensors explicitly, and tensors become NumPy arrays.
+let t = tensor.from(a).to(f32)
+let w = tensor.randn(3, 2)
+print("tensor result shape {(t @ w).shape}")
+print("back in numpy: {np.asarray(t * 2.0).tolist()}")
+print("statistics: mean {mean([1, 2, 3, 4])}, stdev {stdev([1.0, 2.0, 3.0, 4.0]):.3f}")

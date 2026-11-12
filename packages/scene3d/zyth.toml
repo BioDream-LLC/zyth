@@ -1,0 +1,4 @@
+[project]
+name = "scene3d"
+version = "0.1.0"
+description = "3D scenes on zyth.gfx: cameras, meshes, lighting, orbit controls, 3D plots"

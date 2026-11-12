@@ -1,0 +1,47 @@
+{
+  "name": "Zyth",
+  "scopeName": "source.zyth",
+  "fileTypes": ["zyth", "zyi"],
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#strings" },
+    { "name": "meta.annotation.zyth", "match": "@[A-Za-z_][A-Za-z0-9_]*" },
+    { "name": "keyword.control.zyth", "match": "\\b(if|else|match|for|in|while|loop|break|continue|return|go|scope|parallel|pipeline|no_grad|comptime|region|danger)\\b" },
+    { "name": "storage.type.zyth", "match": "\\b(let|var|const|fn|struct|enum|trait|impl|type|model|use|as|pub|extern|where|requires|ensures|move|borrow|mut|drop|on)\\b" },
+    { "name": "constant.language.zyth", "match": "\\b(true|false|None|self|Self)\\b" },
+    { "name": "support.type.primitive.zyth", "match": "\\b(i8|i16|i32|i64|u8|u16|u32|u64|f8|f16|bf16|f32|f64|bool|char|str|tensor|map|set|cpu|gpu|npu)\\b" },
+    { "name": "entity.name.type.zyth", "match": "\\b[A-Z][A-Za-z0-9_]*\\b" },
+    { "name": "entity.name.function.zyth", "match": "\\b[a-z_][A-Za-z0-9_]*(?=\\s*\\()" },
+    { "name": "constant.numeric.zyth", "match": "\\b(0x[0-9a-fA-F_]+|0b[01_]+|[0-9][0-9_]*(\\.[0-9][0-9_]*)?([eE][+-]?[0-9]+)?)\\b" },
+    { "name": "keyword.operator.zyth", "match": "(\\|>|->|=>|\\?\\?|\\*\\*|@|∇|\\.\\.=?|==|!=|<=|>=|&&|\\|\\||[-+*/%<>=!?])" }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        { "name": "comment.line.documentation.zyth", "match": "///.*$" },
+        { "name": "comment.line.double-slash.zyth", "match": "//.*$" },
+        { "name": "comment.block.zyth", "begin": "/\\*", "end": "\\*/" }
+      ]
+    },
+    "strings": {
+      "patterns": [
+        {
+          "name": "string.quoted.triple.zyth", "begin": "\"\"\"", "end": "\"\"\"",
+          "patterns": [{ "include": "#interpolation" }, { "name": "constant.character.escape.zyth", "match": "\\\\." }]
+        },
+        { "name": "string.quoted.raw.zyth", "begin": "r\"", "end": "\"" },
+        {
+          "name": "string.quoted.double.zyth", "begin": "\"", "end": "\"",
+          "patterns": [{ "name": "constant.character.escape.zyth", "match": "\\\\.|\\{\\{|\\}\\}" }, { "include": "#interpolation" }]
+        },
+        { "name": "string.quoted.single.zyth", "match": "'(\\\\.|[^'\\\\])'" }
+      ]
+    },
+    "interpolation": {
+      "name": "meta.interpolation.zyth", "begin": "\\{", "end": "\\}",
+      "beginCaptures": { "0": { "name": "punctuation.section.interpolation.begin.zyth" } },
+      "endCaptures": { "0": { "name": "punctuation.section.interpolation.end.zyth" } },
+      "patterns": [{ "include": "source.zyth" }]
+    }
+  }
+}

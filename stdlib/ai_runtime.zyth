@@ -1,0 +1,24 @@
+// The local AI engine's model steps (module `zyth.ai.runtime`, loaded by zyth-interp's ai_local.rs).
+/// Run token `ids` after the cached `past` (one `(keys, values)` per layer, or `[]`) from position `pos`.
+/// Returns the logits of the last position (or of every new position with `all`) and the new cache.
+pub fn step(model, ids, past, pos: i64, all: bool) {
+    no_grad {
+        let dev = model.embed_tokens.weight.device
+        let (cos, sin) = model.rope(pos, ids.len(), dev)
+        var x = model.embed_tokens(tensor.from([ids]).to(dev))
+        var out = []
+        var i = 0
+        for block in model.layers {
+            let (h, k, v) = block.forward_cached(x, cos, sin, if past.len() > 0 { Some(past[i]) } else { None })
+            out.push((k, v))
+            x = h
+            i += 1
+        }
+        let n = model.norm(x)
+        let logits = if all { model.logits(n)[0] } else { model.logits(n[:, -1])[0] }
+        return (logits.to(cpu), out)
+    }
+}
+
+/// The first `n` positions of a cache.
+pub fn keep(past, n: i64) = past.map(|kv| (kv.0[:, :, :n], kv.1[:, :, :n]))

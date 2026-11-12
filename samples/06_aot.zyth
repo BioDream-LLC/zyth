@@ -1,0 +1,41 @@
+// The same program interpreted and compiled to machine code:
+//   zyth run 06_aot.zyth          zyth run --aot 06_aot.zyth
+// Typed numeric code becomes machine arithmetic; everything else (lists, maps,
+// strings) goes through the interpreter's own operations, so output is identical.
+fn collatz_len(n: i64) -> i64 {
+    var x = n
+    var steps = 0
+    while x != 1 {
+        x = if x % 2 == 0 { x / 2 } else { 3 * x + 1 }
+        steps += 1
+    }
+    return steps
+}
+
+fn longest(limit: i64) -> (i64, i64) {
+    var best = 1
+    var best_len = 0
+    for n in 1..limit {
+        let l = collatz_len(n)
+        if l > best_len {
+            best = n
+            best_len = l
+        }
+    }
+    return (best, best_len)
+}
+
+fn word_counts(text) {
+    var counts = {}
+    for w in text.lower().split(" ") {
+        if w.len() > 3 { counts[w] = counts.get(w).unwrap_or(0) + 1 }
+    }
+    return counts
+}
+
+var t = clock()
+print("longest Collatz chain below 300000:", longest(300000), "{(clock() - t) * 1000.0:.0f} ms")
+t = clock()
+let text = "the quick brown fox jumps over the lazy dog while the brown cat sleeps " * 2000
+let c = word_counts(text)
+print("brown:", c["brown"], "sleeps:", c["sleeps"], "{(clock() - t) * 1000.0:.0f} ms")

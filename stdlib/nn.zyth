@@ -1,0 +1,490 @@
+/// Neural-network layers (module `zyth.nn`).
+///
+/// Every layer is an ordinary `model`, so parameters are collected
+/// automatically and layers compose by calling each other.
+/// `Linear`, `Embedding`, `LayerNorm`, `RMSNorm`, `Dropout`, and `MLP`
+/// are also in the prelude.
+
+/// A fully connected layer: `y = x @ w + b`. Write `Linear(784 -> 256)`.
+pub model Linear(in_features: i64, out_features: i64, bias: bool = true) {
+    w: tensor<f32, [in_features, out_features]> = (tensor.rand(in_features, out_features) * 2.0 - 1.0) * (1.0 / sqrt(in_features as f64))
+    b = if bias { Some(tensor.zeros(out_features)) } else { None }
+
+    fn forward(self, x: tensor<f32, [..., in_features]>) -> tensor<f32, [..., out_features]> {
+        return match self.b {
+            Some(b) => x.linear(self.w, bias: b)
+            None    => x @ self.w
+        }
+    }
+}
+
+/// A Linear layer split over `n` GPUs by its output features (Megatron-LM's column-parallel
+/// layer): GPU i holds columns i·out/n to (i+1)·out/n of the weight and computes that share of
+/// the output from the whole input; the shares are joined on GPU 0. `out_features` must be a
+/// multiple of `n`. The layer places its own pieces: do not move it with `.to(gpu)`. With fewer
+/// GPUs than `n` the pieces share them (all on GPU 0 with one), and the numbers are the same.
+pub model ColumnParallelLinear(in_features: i64, out_features: i64, n: i64 = 2, bias: bool = true) {
+    ws = (0..n).map(|i| ((tensor.rand(in_features, out_features / n) * 2.0 - 1.0) * (1.0 / sqrt(in_features as f64))).to(gpu(i)))
+    bs = if bias { (0..n).map(|i| tensor.zeros(out_features / n).to(gpu(i))) } else { [] }
+
+    fn forward(self, x) {
+        return concat(self.pieces(x).map(|y| y.to(gpu(0))), axis: -1)
+    }
+
+    /// The output's shares, each left on its GPU: for a `RowParallelLinear` next
+    /// (`row.forward_pieces(col.pieces(x).map(|p| p.gelu()))`, Megatron-LM's MLP), which then
+    /// moves only the final sums between GPUs.
+    fn pieces(self, x) {
+        var outs = []
+        for i in 0..self.ws.len() {
+            var y = x.to(gpu(i)) @ self.ws[i]
+            if self.bs.len() > 0 {
+                y = y + self.bs[i]
+            }
+            outs.push(y)
+        }
+        return outs
+    }
+}
+
+/// A Linear layer split over `n` GPUs by its input features (Megatron-LM's row-parallel
+/// layer): GPU i holds rows i·in/n to (i+1)·in/n of the weight and multiplies its slice of the
+/// input's last dimension; the partial results are added on GPU 0 (with the bias, once).
+/// `in_features` must be a multiple of `n`. As `ColumnParallelLinear`, it places its own pieces.
+pub model RowParallelLinear(in_features: i64, out_features: i64, n: i64 = 2, bias: bool = true) {
+    ws = (0..n).map(|i| ((tensor.rand(in_features / n, out_features) * 2.0 - 1.0) * (1.0 / sqrt(in_features as f64))).to(gpu(i)))
+    b = if bias { Some(tensor.zeros(out_features).to(gpu(0))) } else { None }
+
+    fn forward(self, x) {
+        let k = self.ws[0].shape[0]
+        var parts = []
+        for i in 0..self.ws.len() {
+            parts.push(x.narrow(-1, i * k, k))
+        }
+        return self.forward_pieces(parts)
+    }
+
+    /// The output for an input already split by GPU (`ColumnParallelLinear.pieces`).
+    fn forward_pieces(self, parts) {
+        var total = None
+        for i in 0..self.ws.len() {
+            let part = (parts[i].to(gpu(i)) @ self.ws[i]).to(gpu(0))
+            total = match total {
+                Some(t) => Some(t + part)
+                None => Some(part)
+            }
+        }
+        let y = total.unwrap()
+        return match self.b {
+            Some(b) => y + b
+            None => y
+        }
+    }
+}
+
+/// A lookup table of `num` vectors of size `dim`. Write `Embedding(vocab -> dim)`.
+pub model Embedding(num: i64, dim: i64) {
+    weight: tensor<f32, [num, dim]> = tensor.randn(num, dim) * 0.02
+
+    fn forward(self, ids) -> tensor {
+        return self.weight[ids]
+    }
+}
+
+/// Layer normalization over the last dimension.
+pub model LayerNorm(dim: i64, eps: f64 = 1e-5) {
+    weight = tensor.ones(dim)
+    bias = tensor.zeros(dim)
+
+    fn forward(self, x: tensor<f32, [..., dim]>) -> tensor<f32, [..., dim]> = layer_norm(x, self.weight, self.bias, eps: eps)
+}
+
+/// Root-mean-square normalization over the last dimension.
+pub model RMSNorm(dim: i64, eps: f64 = 1e-6) {
+    weight = tensor.ones(dim)
+
+    fn forward(self, x: tensor<f32, [..., dim]>) -> tensor<f32, [..., dim]> = rms_norm(x, self.weight, eps: eps)
+}
+
+/// Randomly zeroes elements while training (gradients enabled); identity inside `no_grad`.
+pub model Dropout(p: f64 = 0.1) {
+    fn forward(self, x) = dropout(x, p: p)
+}
+
+/// 2-D convolution over `[N, C, H, W]`. Write `Conv2d(3 -> 16, kernel: 3, padding: 1)`.
+/// `padding` may also be "same" (stride 1). The weight is `[out, in / groups, kernel, kernel]`.
+pub model Conv2d(in_channels: i64, out_channels: i64, kernel: i64 = 3, stride: i64 = 1, padding: i64 = 0, dilation: i64 = 1, groups: i64 = 1, bias: bool = true) {
+    w: tensor<f32, [out_channels, (in_channels / groups), kernel, kernel]> = (tensor.rand(out_channels, in_channels / groups, kernel, kernel) * 2.0 - 1.0) * (1.0 / sqrt((in_channels / groups * kernel * kernel) as f64))
+    b = if bias { Some(tensor.zeros(out_channels)) } else { None }
+
+    fn forward(self, x: tensor<f32, [B, in_channels, H, W]>) -> tensor<f32, [B, out_channels, _, _]> = conv2d(x, self.w, bias: self.b, stride: stride, padding: padding, dilation: dilation, groups: groups)
+}
+
+/// 1-D convolution over `[N, C, L]`. Write `Conv1d(80 -> 384, kernel: 3, padding: 1)`.
+pub model Conv1d(in_channels: i64, out_channels: i64, kernel: i64 = 3, stride: i64 = 1, padding: i64 = 0, dilation: i64 = 1, groups: i64 = 1, bias: bool = true) {
+    w: tensor<f32, [out_channels, (in_channels / groups), kernel]> = (tensor.rand(out_channels, in_channels / groups, kernel) * 2.0 - 1.0) * (1.0 / sqrt((in_channels / groups * kernel) as f64))
+    b = if bias { Some(tensor.zeros(out_channels)) } else { None }
+
+    fn forward(self, x: tensor<f32, [B, in_channels, L]>) -> tensor<f32, [B, out_channels, _]> = conv1d(x, self.w, bias: self.b, stride: stride, padding: padding, dilation: dilation, groups: groups)
+}
+
+/// Max pooling over `[N, C, H, W]`; `stride` defaults to `kernel`.
+pub model MaxPool2d(kernel: i64 = 2, stride: i64 = 0, padding: i64 = 0) {
+    fn forward(self, x: tensor<f32, [B, C, H, W]>) -> tensor<f32, [B, C, _, _]> = max_pool2d(x, kernel, stride: if stride == 0 { kernel } else { stride }, padding: padding)
+}
+
+/// Average pooling over `[N, C, H, W]`; `stride` defaults to `kernel`.
+pub model AvgPool2d(kernel: i64 = 2, stride: i64 = 0, padding: i64 = 0) {
+    fn forward(self, x: tensor<f32, [B, C, H, W]>) -> tensor<f32, [B, C, _, _]> = avg_pool2d(x, kernel, stride: if stride == 0 { kernel } else { stride }, padding: padding)
+}
+
+/// Two linear layers with a GELU in between.
+pub model MLP(dim: i64, hidden: i64) {
+    fc = Linear(dim -> hidden)
+    proj = Linear(hidden -> dim)
+
+    fn forward(self, x) = self.proj(gelu(self.fc(x)))
+}
+
+/// Multi-head self-attention (causal by default, as in GPT).
+pub model MultiHeadAttention(dim: i64, heads: i64, causal: bool = true) {
+    qkv = Linear(dim -> 3 * dim)
+    proj = Linear(dim -> dim)
+
+    fn forward(self, x: tensor<f32, [B, T, dim]>) -> tensor<f32, [B, T, dim]> {
+        // softmax(q k^T / sqrt(head_dim)) v per head; one fused operation on the CPU
+        return self.proj(attention(self.qkv(x), heads: heads, causal: causal))
+    }
+
+    /// Attention for new positions given `past = Some((keys, values))` of
+    /// earlier ones (`[B, heads, T_past, head_dim]`) or `None`. Returns `(y, keys, values)`.
+    fn forward_cached(self, x, past) {
+        let b = x.shape[0]
+        let t = x.shape[1]
+        let hd = dim / heads
+        let parts = self.qkv(x).split([dim, dim, dim], axis: -1)
+        let q = parts[0].reshape(b, t, heads, hd).transpose(1, 2)
+        let k_new = parts[1].reshape(b, t, heads, hd).transpose(1, 2)
+        let v_new = parts[2].reshape(b, t, heads, hd).transpose(1, 2)
+        let (k, v, n_past) = match past {
+            Some((pk, pv)) => (concat([pk, k_new], axis: 2), concat([pv, v_new], axis: 2), pk.shape[2])
+            None           => (k_new, v_new, 0)
+        }
+        var att = (q @ k.transpose(-2, -1)) * (1.0 / sqrt(hd as f64))
+        if causal && t > 1 {
+            att = att.masked_fill(tensor.causal_mask(t, offset: n_past, device: x.device), -1e9)
+        }
+        let y = (softmax(att, axis: -1) @ v).transpose(1, 2).reshape(b, t, dim)
+        return (self.proj(y), k, v)
+    }
+}
+
+/// A pre-norm transformer block: attention then MLP, each with a residual connection.
+pub model TransformerBlock(dim: i64, heads: i64, causal: bool = true) {
+    ln1 = LayerNorm(dim)
+    attn = MultiHeadAttention(dim, heads, causal: causal)
+    ln2 = LayerNorm(dim)
+    mlp = MLP(dim, 4 * dim)
+
+    fn forward(self, x: tensor<f32, [B, T, dim]>) -> tensor<f32, [B, T, dim]> {
+        let h = x + self.attn(self.ln1(x))
+        return h + self.mlp(self.ln2(h))
+    }
+
+    /// `forward` with a key/value cache (see `MultiHeadAttention.forward_cached`).
+    fn forward_cached(self, x, past) {
+        let (a, k, v) = self.attn.forward_cached(self.ln1(x), past)
+        let h = x + a
+        return (h + self.mlp(self.ln2(h)), k, v)
+    }
+}
+
+/// Sample the next token id from `logits` `[vocab]`: greedy at temperature 0
+/// (or below), otherwise sampling at `temperature` from the `top_k` most likely
+/// tokens (all tokens when `top_k` is 0).
+pub fn sample_token(logits, temperature: f64 = 0.8, top_k: i64 = 40) -> i64 {
+    if temperature <= 0.0 {
+        return logits.argmax()
+    }
+    if top_k <= 0 {
+        return softmax(logits / temperature).multinomial().item()
+    }
+    let (vals, idx) = (logits / temperature).topk(top_k)
+    return idx[softmax(vals).multinomial().item()].item()
+}
+
+/// A GPT-style decoder-only transformer language model.
+pub model Transformer(layers: i64, heads: i64, dim: i64, vocab: i64, context: i64) {
+    tok_emb = Embedding(vocab -> dim)
+    pos_emb = Embedding(context -> dim)
+    blocks = (0..layers).map(|_| TransformerBlock(dim, heads))
+    ln_f = LayerNorm(dim)
+    head = Linear(dim -> vocab, bias: false)
+
+    /// The final hidden states (before the output layer).
+    fn hidden(self, ids: tensor<i64, [B, T]>) -> tensor<f32, [B, T, dim]> {
+        let t = ids.shape[1]
+        var x = self.tok_emb(ids) + self.pos_emb(tensor.arange(t))
+        for block in self.blocks {
+            x = block(x)
+        }
+        return self.ln_f(x)
+    }
+
+    fn forward(self, ids: tensor<i64, [B, T]>) -> tensor<f32, [B, T, vocab]> = self.head(self.hidden(ids))
+
+    /// `n` continuations of `prompt` sampled together; each stops after `stop` (if given) or `max_tokens`.
+    /// Returns the new tokens of each continuation (including `stop`). The prompt plus the new tokens must fit in `context`.
+    fn generate_batch(self, prompt, n: i64 = 1, max_tokens: i64 = 40, temperature: f64 = 0.8, top_k: i64 = 40, stop: i64 = -1) -> i64[][] {
+        var outs = (0..n).map(|_| [])
+        var done = (0..n).map(|_| false)
+        let p = list(prompt)
+        let steps = min(max_tokens, context - p.len())
+        no_grad {
+            var ks = []
+            var vs = []
+            var pos = 0
+            var input = tensor.from((0..n).map(|_| p))
+            for _ in 0..steps {
+                let t = input.shape[1]
+                var x = self.tok_emb(input) + self.pos_emb(tensor.arange(pos, pos + t))
+                var i = 0
+                for block in self.blocks {
+                    let cached = i < ks.len()
+                    let (hh, k, v) = block.forward_cached(x, if cached { Some((ks[i], vs[i])) } else { None })
+                    if cached {
+                        ks[i] = k
+                        vs[i] = v
+                    } else {
+                        ks.push(k)
+                        vs.push(v)
+                    }
+                    x = hh
+                    i += 1
+                }
+                pos += t
+                let last = self.head(self.ln_f(x)[.., -1])
+                var next = []
+                for r in 0..n {
+                    let tok = sample_token(last[r], temperature: temperature, top_k: top_k)
+                    if !done[r] {
+                        outs[r].push(tok)
+                        if tok == stop {
+                            done[r] = true
+                        }
+                    }
+                    next.push([tok])
+                }
+                if done.all(|d| d) {
+                    break
+                }
+                input = tensor.from(next)
+            }
+        }
+        return outs
+    }
+
+    /// Sample `max_tokens` new token ids after `prompt` (a list or tensor of ids).
+    /// Keys and values of earlier positions are cached, so each new token costs
+    /// one position of compute; when the context is full, the window restarts.
+    fn generate(self, prompt, max_tokens: i64 = 100, temperature: f64 = 1.0) -> i64[] {
+        var ids = list(prompt)
+        no_grad {
+            var ks = []
+            var vs = []
+            var pos = 0
+            var input = ids[max(0, ids.len() - context):]
+            for _ in 0..max_tokens {
+                if pos + input.len() > context {
+                    // the cache is full: start again from the most recent tokens
+                    ks = []
+                    vs = []
+                    pos = 0
+                    input = ids[ids.len() - context / 2:]
+                }
+                let n = input.len()
+                var x = self.tok_emb(tensor.from([input])) + self.pos_emb(tensor.arange(pos, pos + n))
+                var i = 0
+                for block in self.blocks {
+                    let cached = i < ks.len()
+                    let (h, k, v) = block.forward_cached(x, if cached { Some((ks[i], vs[i])) } else { None })
+                    if cached {
+                        ks[i] = k
+                        vs[i] = v
+                    } else {
+                        ks.push(k)
+                        vs.push(v)
+                    }
+                    x = h
+                    i += 1
+                }
+                pos += n
+                let logits = self.head(self.ln_f(x)[0, -1])
+                // temperature 0 (or below) means greedy decoding
+                let next = if temperature <= 0.0 { logits.argmax() } else { softmax(logits / temperature).multinomial().item() }
+                ids.push(next)
+                input = [next]
+            }
+        }
+        return ids
+    }
+}
+
+/// A mixture-of-experts layer with its experts spread over `n` GPUs (expert parallelism):
+/// expert e (an `MLP(dim, hidden)`) lives on GPU e mod n, a router on GPU 0 picks the `top_k`
+/// experts of each token, the tokens go to their experts' GPUs and come back weighted by the
+/// router's probabilities (renormalized over the chosen experts, as in Mixtral). The input is
+/// `[N, dim]` or `[B, T, dim]` on GPU 0 (or the CPU with one device); the output is alike.
+/// Places its own experts: do not move it with `.to(gpu)`.
+///
+/// `capacity` (0: none) limits each expert to `ceil(capacity * tokens * top_k / experts)`
+/// tokens per call, as Switch Transformer and GShard do: when more choose it, it takes those
+/// whose router probability for it is highest, and the others get nothing from it (their
+/// weights are renormalized over the experts that did take them; a token no expert took gives
+/// zeros, so a residual connection carries it). `m.with_aux(x)` gives `(output, aux)`, where
+/// `aux` is the load-balancing loss of Switch Transformer (`experts * sum_e f_e * P_e`: the
+/// share of choices that went to expert e times its mean router probability; 1.0 when the
+/// load is even): add `alpha * aux` (Switch used 0.01) to the training loss. `m.load(x)` gives
+/// how many tokens each expert took and how many choices were dropped.
+pub model MoE(dim: i64, hidden: i64, experts: i64 = 8, top_k: i64 = 2, n: i64 = 2, capacity: f64 = 0.0) {
+    router = Linear(dim -> experts).to(gpu(0))
+    ws1 = (0..experts).map(|e| ((tensor.rand(dim, hidden) * 2.0 - 1.0) * (1.0 / sqrt(dim as f64))).to(gpu(e % n)))
+    bs1 = (0..experts).map(|e| tensor.zeros(hidden).to(gpu(e % n)))
+    ws2 = (0..experts).map(|e| ((tensor.rand(hidden, dim) * 2.0 - 1.0) * (1.0 / sqrt(hidden as f64))).to(gpu(e % n)))
+    bs2 = (0..experts).map(|e| tensor.zeros(dim).to(gpu(e % n)))
+
+    // which tokens each expert takes, with the capacity limit: (chosen[e], mask[t][e], dropped)
+    fn route(self, p: f64[][], rows: i64) {
+        let k = min(top_k, experts)
+        var wants: i64[][] = (0..experts).map(|_| [])
+        for t in 0..rows {
+            var order = (0..experts).to_list()
+            order.sort_by(|a, b| p[t][b].partial_cmp(p[t][a]))
+            for j in 0..k {
+                wants[order[j]].push(t)
+            }
+        }
+        let cap = if capacity > 0.0 { (capacity * (rows * k) as f64 / experts as f64).ceil() as i64 } else { rows }
+        var chosen: i64[][] = (0..experts).map(|_| [])
+        var mask: f64[][] = (0..rows).map(|_| (0..experts).map(|_| 0.0))
+        var dropped = 0
+        for e in 0..experts {
+            var ts = wants[e]
+            if ts.len() > cap {
+                // the tokens that want it most
+                ts.sort_by(|a, b| p[b][e].partial_cmp(p[a][e]))
+                dropped += ts.len() - cap
+                ts = ts[0:cap]
+                ts.sort()
+            }
+            for t in ts {
+                mask[t][e] = 1.0
+            }
+            chosen[e] = ts
+        }
+        return (chosen, mask, dropped)
+    }
+
+    fn with_aux(self, x) {
+        let shape = x.shape
+        let flat = x.reshape(-1, dim)
+        let rows = flat.shape[0]
+        let probs = softmax(self.router(flat), axis: -1)
+        // the routing itself (which experts): decided from the probabilities' values
+        let p = probs.detach().to(cpu).to_list()
+        let (chosen, mask, _) = self.route(p, rows)
+        let mt = tensor.from(mask).to(probs.dtype).to(probs.device)
+        // (a token no expert took: its weights divide by 1, and it gets zeros)
+        let taken = mt.sum(axis: -1, keepdim: true)
+        let denom = (probs * mt).sum(axis: -1, keepdim: true) + (taken == 0.0).to(probs.dtype)
+        var out = tensor.zeros(rows, dim).to(flat.dtype).to(flat.device)
+        for e in 0..experts {
+            if chosen[e].len() == 0 { continue }
+            let ids = tensor.from(chosen[e]).to(i64).to(flat.device)
+            let dev = self.ws1[e].device
+            let xe = flat.index_select(ids).to(dev)
+            let ye = ((xe @ self.ws1[e] + self.bs1[e]).gelu() @ self.ws2[e] + self.bs2[e]).to(flat.device)
+            let gate = probs.index_select(ids).narrow(-1, e, 1) / denom.index_select(ids)
+            out = out.index_add(ids, ye * gate)
+        }
+        // load balancing (Switch Transformer): the share of choices per expert (before the
+        // capacity limit, counted on the host) times the mean router probability (with gradient)
+        let k = min(top_k, experts)
+        var f: f64[] = (0..experts).map(|_| 0.0)
+        for t in 0..rows {
+            var order = (0..experts).to_list()
+            order.sort_by(|a, b| p[t][b].partial_cmp(p[t][a]))
+            for j in 0..k {
+                f[order[j]] += 1.0 / (rows * k) as f64
+            }
+        }
+        let share = tensor.from(f).to(probs.dtype).to(probs.device)
+        let aux = (share * probs.mean(axis: 0)).sum() * experts as f64
+        return (out.reshape(shape), aux)
+    }
+
+    fn forward(self, x) {
+        let (out, _) = self.with_aux(x)
+        return out
+    }
+
+    /// How many tokens each expert takes for `x`, and how many choices the capacity dropped.
+    fn load(self, x) {
+        let flat = x.reshape(-1, dim)
+        let p = softmax(self.router(flat), axis: -1).detach().to(cpu).to_list()
+        let (chosen, _, dropped) = self.route(p, flat.shape[0])
+        return (chosen.map(|c| c.len()), dropped)
+    }
+}
+
+/// Attention over a sequence split between `n` GPUs (context parallelism, as ring attention):
+/// `q`, `k`, `v` are `[B, H, T, D]`; GPU i takes the i-th share of the positions' queries and
+/// meets every share of keys and values in turn (sent from GPU j), combining the partial
+/// softmaxes exactly (running maxima and sums). With `causal`, a query sees only earlier
+/// positions. Returns `[B, H, T, D]` on `q`'s device; the same numbers as `softmax(q k^T /
+/// sqrt(D)) v`. `T` must be a multiple of `n`.
+pub fn ring_attention(q, k, v, n: i64 = 2, causal: bool = false) {
+    let t = q.shape[2]
+    let c = t / n
+    let scale = 1.0 / sqrt(q.shape[3] as f64)
+    let home = q.device
+    let ks = (0..n).map(|j| k.narrow(2, j * c, c).to(gpu(j)))
+    let vs = (0..n).map(|j| v.narrow(2, j * c, c).to(gpu(j)))
+    var outs = []
+    for i in 0..n {
+        let qi = q.narrow(2, i * c, c).to(gpu(i))
+        var m = None
+        var acc = None
+        var l = None
+        let last = if causal { i } else { n - 1 }
+        for j in 0..last + 1 {
+            var s = (qi @ ks[j].to(gpu(i)).transpose(-2, -1)) * scale
+            if causal && j == i {
+                s = s.masked_fill(tensor.causal_mask(c, device: s.device), -1e9)
+            }
+            // (the maxima only keep the exponentials in range: no gradient goes through them)
+            let mj = s.detach().max(axis: -1, keepdim: true)
+            let mn = match m {
+                Some(mo) => mo.maximum(mj)
+                None => mj
+            }
+            let e = (s - mn).exp()
+            let pv = e @ vs[j].to(gpu(i))
+            let se = e.sum(axis: -1, keepdim: true)
+            match m {
+                Some(mo) => {
+                    let f = (mo - mn).exp()
+                    acc = Some(acc.unwrap() * f + pv)
+                    l = Some(l.unwrap() * f + se)
+                }
+                None => {
+                    acc = Some(pv)
+                    l = Some(se)
+                }
+            }
+            m = Some(mn)
+        }
+        outs.push((acc.unwrap() / l.unwrap()).to(home))
+    }
+    return concat(outs, axis: 2)
+}

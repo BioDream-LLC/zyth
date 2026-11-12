@@ -1,0 +1,13 @@
+// Shape checking before the program runs: the mistake is reported with where
+// each dimension came from. Run with `zyth check 01_shapes.zyth`.
+model Classifier {
+    l1 = Linear(784 -> 256)
+    l2 = Linear(128 -> 10)    // should be 256 -> 10
+
+    fn forward(self, x: tensor<f32, [B, 784]>) -> tensor<f32, [B, 10]> {
+        return self.l2(relu(self.l1(x)))
+    }
+}
+
+let m = Classifier()
+print(m(tensor.randn(32, 784)).shape)

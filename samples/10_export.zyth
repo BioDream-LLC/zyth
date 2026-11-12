@@ -1,0 +1,29 @@
+// Train a small classifier, then save it in Zyth's format and export it to
+// safetensors and ONNX; reload and compare.
+use zyth.optim.Adam
+use zyth.fs
+
+model Net {
+    l1 = Linear(2 -> 16)
+    l2 = Linear(16 -> 2)
+    fn forward(self, x: tensor<f32, [B, 2]>) -> tensor<f32, [B, 2]> = self.l2(tanh(self.l1(x)))
+}
+
+seed(3)
+// points inside the unit circle are class 1
+let x = tensor.rand(512, 2) * 4.0 - 2.0
+let y = ((x * x).sum(axis: 1) < 1.0).to(i64)
+let net = Net()
+let opt = Adam(net.params, lr: 0.03)
+for step in 0..300 {
+    let loss = cross_entropy(net(x), y)
+    opt.step(grad(loss, wrt: net.params))
+}
+let acc = (net(x).argmax(axis: 1) == y).to(f32).mean().item()
+print("training accuracy {acc * 100.0:.1f}%")
+net.save("circle.zyth.model")
+net.export("circle.safetensors")
+net.export("circle.onnx", input: x[:4])
+let back = Net.load("circle.zyth.model")?
+print("reloaded model gives the same outputs:", (back(x) - net(x)).abs().max().item() < 1e-6)
+print("files:", ["circle.zyth.model", "circle.safetensors", "circle.onnx"].map(|f| fs.exists(f)))

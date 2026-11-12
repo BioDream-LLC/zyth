@@ -1,0 +1,87 @@
+// A React component with a 3D view drawn by Zyth on the GPU (WebGPU). The component compiles to
+// JavaScript; the drawing (`zyth.gfx`) runs in WebAssembly in the same package. The canvas goes
+// into the component's `div(id: "zyth-cube")`, and `use_frame` draws one frame per animation
+// frame, at the speed the buttons set (React state).
+// zyth build --target npm-jsx cube.zyth -o cube
+use zyth.react.{div, h2, p, button, use_state, use_frame, Element}
+use zyth.gfx
+
+let s = gfx.window(title: "Zyth cube", width: 320, height: 320, host: "zyth-cube")
+let shader = gfx.shader(r"""
+struct U { angle: f32, tilt: f32, _a: f32, _b: f32 }
+@group(0) @binding(0) var<uniform> u: U;
+struct Out { @builtin(position) pos: vec4f, @location(0) color: vec3f }
+@vertex fn vs(@location(0) p: vec3f, @location(1) n: vec3f, @location(2) c: vec3f) -> Out {
+    let ca = cos(u.angle);
+    let sa = sin(u.angle);
+    let ct = cos(u.tilt);
+    let st = sin(u.tilt);
+    // turn around y, then tilt around x
+    let ry = vec3f(ca * p.x + sa * p.z, p.y, -sa * p.x + ca * p.z);
+    let q = vec3f(ry.x, ct * ry.y - st * ry.z, st * ry.y + ct * ry.z);
+    let ny = vec3f(ca * n.x + sa * n.z, n.y, -sa * n.x + ca * n.z);
+    let m = vec3f(ny.x, ct * ny.y - st * ny.z, st * ny.y + ct * ny.z);
+    let light = max(dot(m, normalize(vec3f(0.4, 0.7, -0.6))), 0.0);
+    var o: Out;
+    // a camera 4 units away; depth from 0 (z = 1) to 1 (z = 7), so nearer faces hide farther ones
+    let z = q.z + 4.0;
+    o.pos = vec4f(q.x * 1.3, q.y * 1.3, (z - 1.0) / 6.0 * z, z);
+    o.color = c * (0.25 + 0.75 * light);
+    return o;
+}
+@fragment fn fs(o: Out) -> @location(0) vec4f { return vec4f(o.color, 1.0); }
+""")
+let pipe = s.pipeline(shader, buffers: [["f32x3", "f32x3", "f32x3"]], depth: true)
+
+/// Two triangles for one face of the unit cube: corner positions, the face's normal, its color.
+fn face(n: f64[], u: f64[], v: f64[], color: f64[]) -> f64[] {
+    var out: f64[] = []
+    for (a, b) in [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)] {
+        for i in 0..3 {
+            out.push(n[i] + a * u[i] + b * v[i])
+        }
+        out = out + n + color
+    }
+    return out
+}
+
+fn cube() -> f64[] {
+    return face([0.0, 0.0, -1.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.95, 0.42, 0.24]) +
+        face([0.0, 0.0, 1.0], [-1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.30, 0.75, 0.55]) +
+        face([1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 1.0, 0.0], [0.98, 0.78, 0.26]) +
+        face([-1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0], [0.35, 0.55, 0.95]) +
+        face([0.0, 1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.85, 0.85, 0.88]) +
+        face([0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.55, 0.35, 0.70])
+}
+
+let vertices = gfx.buffer(cube())
+let uniforms = gfx.buffer([0.0, 0.5, 0.0, 0.0])
+
+/// Draw one frame with the cube turned by `angle` (radians).
+@export
+fn draw(angle: f64) {
+    uniforms.write([angle, 0.5, 0.0, 0.0])
+    s.frame(clear: [0.07, 0.08, 0.10]) { f -> f.draw(pipe, vertices: [vertices], bind: [uniforms]) }
+}
+
+/// A turning cube; the buttons change its speed.
+@export
+fn Cube() -> Element {
+    let (speed, set_speed) = use_state(1.0)
+    let (angle, set_angle) = use_state(0.0)
+    let (last, set_last) = use_state(0.0)
+    use_frame(|t| {
+        let a = angle + (t - last) * speed
+        draw(a)
+        set_angle(a)
+        set_last(t)
+    })
+    return div(class: "cube") {
+        h2 { "A cube drawn by Zyth on the GPU" }
+        div(id: "zyth-cube", class: "view")
+        button(on_click: || set_speed(max(speed * 2.0, 0.5))) { "faster" }
+        button(on_click: || set_speed(speed / 2.0)) { "slower" }
+        button(on_click: || set_speed(0.0)) { "stop" }
+        p(class: "speed") { "speed {speed:.2} radians a second" }
+    }
+}

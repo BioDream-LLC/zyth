@@ -1,0 +1,33 @@
+// scene3d demo: a lit cube, a sphere and a floor, a spiral of points computed as tensors,
+// and an orbit camera (drag to turn, wheel to zoom). `--png out.png` draws one frame off screen.
+use zyth.gfx
+use scene3d.{Scene, Orbit, cube, sphere, plane, mul, translate, rotate_y}
+
+let a = args()
+let png = if a.len() >= 2 && a[0] == "--png" { Some(a[1]) } else { None }
+let s = if png != None { gfx.surface(width: 320, height: 240) } else { gfx.window(title: "scene3d", width: 960, height: 720) }
+
+var scene = Scene.new(s)
+let c = scene.add(cube(), color: [1.0, 0.55, 0.2], at: [0.0, 0.5, 0.0])
+scene.add(sphere(), color: [0.3, 0.6, 1.0], at: [1.4, 0.5, 0.0], size: 0.8)
+scene.add(plane(), color: [0.5, 0.5, 0.5], at: [0.0, 0.0, 0.0], size: 6.0)
+
+let n = 2000
+let t = tensor.arange(n).to(f32) / (n as f32)
+let pos = tensor.stack([(t * 30.0).cos() * 2.2, t * 2.5, (t * 30.0).sin() * 2.2], axis: 1) on gpu
+let col = tensor.stack([t, tensor.ones(n) * 0.9, 1.0 - t], axis: 1) on gpu
+scene.points(pos, col)
+
+var orbit = Orbit.new(distance: 6.0)
+let frames = s.run(frames: if png != None { 1 } else { 1000000 }, clear: [0.05, 0.05, 0.08, 1.0]) { f ->
+    orbit.handle(f.events)
+    scene.place(c, mul(translate(0.0, 0.5, 0.0), rotate_y(f.time)))
+    scene.draw(f, orbit.view(), aspect: f.aspect)
+}
+match png {
+    Some(p) => {
+        s.save(p)
+        print("saved {p}")
+    }
+    None => print("{frames} frames")
+}

@@ -1,0 +1,303 @@
+// FlashAttention (forward, causal, head size 64) on tensor cores, written in Zyth. A block of
+// 4 warps takes 64 query rows, each warp 16 of them, in registers (`mma_a`); for each tile of
+// 32 keys, the scores Q K^T and the output P V are tensor-core products (`mma`: tf32 inputs,
+// `mma_bf16`: bf16 inputs; f32 sums), and the online softmax runs on the accumulators, whose
+// layout `mma_row`/`mma_col` give. Needs an NVIDIA GPU of compute capability 8.0 or newer
+// for speed; elsewhere (CPU, WebGPU) the same kernels give the same values, slowly.
+// The f32 version without tensor cores: flash_attention.zyth.
+
+kernel fn flash_tf32(q: tensor<f32>, k: tensor<f32>, v: tensor<f32>, out: mut tensor<f32>, t: i64, scale: f32) {
+    var kts = shared(f32, 2560)         // the key tile transposed: 64 dims x 32 keys (padded to 40)
+    var vs = shared(f32, 2304)          // 32 keys x 64 values (padded to 72)
+    var ss = shared(f32, 2304)          // per warp 16 x 32 scores, then weights (padded to 36)
+    var pm = shared(f32, 512)           // per warp, row and thread of the row: partial maxima, then sums
+    let tid = thread.x
+    let w = tid / 32
+    let lane = thread.lane
+    let r0 = block.x * 64
+    let base = block.y * t * 64
+    // this warp's 16 queries in registers, as four 16 x 16 A fragments (tf32 or bf16)
+    let qrow = base + (r0 + w * 16) * 64
+    let qa0 = mma_a(q, qrow, 64)
+    let qa1 = mma_a(q, qrow + 16, 64)
+    let qa2 = mma_a(q, qrow + 32, 64)
+    let qa3 = mma_a(q, qrow + 48, 64)
+    let o0 = mma_acc()
+    let o1 = mma_acc()
+    let o2 = mma_acc()
+    let o3 = mma_acc()
+    var ma = -1e30                       // running max and sum (this thread's part) of rows g, g + 8
+    var mb = -1e30
+    var la = 0.0
+    var lb = 0.0
+    var kt = 0
+    while kt < r0 + 64 && kt < t {
+        for u in 0..16 {
+            let e = tid + 128 * u
+            let kr = e / 64
+            let dd = e % 64
+            let ok = kt + kr < t
+            kts[dd * 40 + kr] = if ok { k[base + (kt + kr) * 64 + dd] } else { 0.0 }
+            vs[kr * 72 + dd] = if ok { v[base + (kt + kr) * 64 + dd] } else { 0.0 }
+        }
+        sync()
+        let s0 = mma_acc()
+        let s1 = mma_acc()
+            mma(s0, qa0, kts, 0, 40)
+            mma(s1, qa0, kts, 16, 40)
+            mma(s0, qa1, kts, 640, 40)
+            mma(s1, qa1, kts, 656, 40)
+            mma(s0, qa2, kts, 1280, 40)
+            mma(s1, qa2, kts, 1296, 40)
+            mma(s0, qa3, kts, 1920, 40)
+            mma(s1, qa3, kts, 1936, 40)
+        for e in 0..8 {
+            s0[e] = s0[e] * scale
+            s1[e] = s1[e] * scale
+        }
+        // the softmax on the accumulators: this thread holds 8 scores of rows g and g + 8
+        // (g = lane / 4); the 4 threads of a row combine their maxima through shared memory
+        let g = lane / 4
+        var pa = -1e30
+        var pb = -1e30
+        for e in 0..8 {
+            let rr = r0 + w * 16 + mma_row(e)
+            let c = kt + mma_col(e)
+            if c > rr || c >= t { s0[e] = -1e30 }
+            if c + 16 > rr || c + 16 >= t { s1[e] = -1e30 }
+            if mma_row(e) == g {
+                pa = max(pa, max(s0[e], s1[e]))
+            } else {
+                pb = max(pb, max(s0[e], s1[e]))
+            }
+        }
+        pm[w * 128 + g * 4 + lane % 4] = pa
+        pm[w * 128 + 64 + g * 4 + lane % 4] = pb
+        sync()
+        var na = ma
+        var nb = mb
+        for x in 0..4 {
+            na = max(na, pm[w * 128 + g * 4 + x])
+            nb = max(nb, pm[w * 128 + 64 + g * 4 + x])
+        }
+        let ca = exp(ma - na)
+        let cb = exp(mb - nb)
+        ma = na
+        mb = nb
+        la = la * ca
+        lb = lb * cb
+        for e in 0..8 {
+            let top = mma_row(e) == g
+            let nm = if top { na } else { nb }
+            let p0 = exp(s0[e] - nm)
+            let p1 = exp(s1[e] - nm)
+            s0[e] = p0
+            s1[e] = p1
+            let f = if top { ca } else { cb }
+            if top { la += p0 + p1 } else { lb += p0 + p1 }
+            o0[e] = o0[e] * f
+            o1[e] = o1[e] * f
+            o2[e] = o2[e] * f
+            o3[e] = o3[e] * f
+        }
+        mma_store(s0, ss, w * 576, 36)
+        mma_store(s1, ss, w * 576 + 16, 36)
+        sync()
+        for kc in 0..2 {
+                    mma(o0, ss, w * 576 + kc * 16, 36, vs, kc * 16 * 72, 72)
+                mma(o1, ss, w * 576 + kc * 16, 36, vs, kc * 16 * 72 + 16, 72)
+                mma(o2, ss, w * 576 + kc * 16, 36, vs, kc * 16 * 72 + 32, 72)
+                mma(o3, ss, w * 576 + kc * 16, 36, vs, kc * 16 * 72 + 48, 72)
+            }
+        sync()
+        kt += 32
+    }
+    pm[w * 128 + (lane / 4) * 4 + lane % 4] = la
+    pm[w * 128 + 64 + (lane / 4) * 4 + lane % 4] = lb
+    sync()
+    var sa = 0.0
+    var sb = 0.0
+    for x in 0..4 {
+        sa += pm[w * 128 + (lane / 4) * 4 + x]
+        sb += pm[w * 128 + 64 + (lane / 4) * 4 + x]
+    }
+    for e in 0..8 {
+        let f = if mma_row(e) == lane / 4 { 1.0 / sa } else { 1.0 / sb }
+        o0[e] = o0[e] * f
+        o1[e] = o1[e] * f
+        o2[e] = o2[e] * f
+        o3[e] = o3[e] * f
+    }
+    // (t is a multiple of 64 here, so every row of the tile exists)
+    let ob = base + (r0 + w * 16) * 64
+    mma_store(o0, out, ob, 64)
+    mma_store(o1, out, ob + 16, 64)
+    mma_store(o2, out, ob + 32, 64)
+    mma_store(o3, out, ob + 48, 64)
+}
+
+kernel fn flash_bf16(q: tensor<f32>, k: tensor<f32>, v: tensor<f32>, out: mut tensor<f32>, t: i64, scale: f32) {
+    var kts = shared(f32, 2560)         // the key tile transposed: 64 dims x 32 keys (padded to 40)
+    var vs = shared(f32, 2304)          // 32 keys x 64 values (padded to 72)
+    var ss = shared(f32, 2304)          // per warp 16 x 32 scores, then weights (padded to 36)
+    var pm = shared(f32, 512)           // per warp, row and thread of the row: partial maxima, then sums
+    let tid = thread.x
+    let w = tid / 32
+    let lane = thread.lane
+    let r0 = block.x * 64
+    let base = block.y * t * 64
+    // this warp's 16 queries in registers, as four 16 x 16 A fragments (tf32 or bf16)
+    let qrow = base + (r0 + w * 16) * 64
+    let qb0 = mma_a_bf16(q, qrow, 64)
+    let qb1 = mma_a_bf16(q, qrow + 16, 64)
+    let qb2 = mma_a_bf16(q, qrow + 32, 64)
+    let qb3 = mma_a_bf16(q, qrow + 48, 64)
+    let o0 = mma_acc()
+    let o1 = mma_acc()
+    let o2 = mma_acc()
+    let o3 = mma_acc()
+    var ma = -1e30                       // running max and sum (this thread's part) of rows g, g + 8
+    var mb = -1e30
+    var la = 0.0
+    var lb = 0.0
+    var kt = 0
+    while kt < r0 + 64 && kt < t {
+        for u in 0..16 {
+            let e = tid + 128 * u
+            let kr = e / 64
+            let dd = e % 64
+            let ok = kt + kr < t
+            kts[dd * 40 + kr] = if ok { k[base + (kt + kr) * 64 + dd] } else { 0.0 }
+            vs[kr * 72 + dd] = if ok { v[base + (kt + kr) * 64 + dd] } else { 0.0 }
+        }
+        sync()
+        let s0 = mma_acc()
+        let s1 = mma_acc()
+            mma_bf16(s0, qb0, kts, 0, 40)
+            mma_bf16(s1, qb0, kts, 16, 40)
+            mma_bf16(s0, qb1, kts, 640, 40)
+            mma_bf16(s1, qb1, kts, 656, 40)
+            mma_bf16(s0, qb2, kts, 1280, 40)
+            mma_bf16(s1, qb2, kts, 1296, 40)
+            mma_bf16(s0, qb3, kts, 1920, 40)
+            mma_bf16(s1, qb3, kts, 1936, 40)
+        for e in 0..8 {
+            s0[e] = s0[e] * scale
+            s1[e] = s1[e] * scale
+        }
+        // the softmax on the accumulators: this thread holds 8 scores of rows g and g + 8
+        // (g = lane / 4); the 4 threads of a row combine their maxima through shared memory
+        let g = lane / 4
+        var pa = -1e30
+        var pb = -1e30
+        for e in 0..8 {
+            let rr = r0 + w * 16 + mma_row(e)
+            let c = kt + mma_col(e)
+            if c > rr || c >= t { s0[e] = -1e30 }
+            if c + 16 > rr || c + 16 >= t { s1[e] = -1e30 }
+            if mma_row(e) == g {
+                pa = max(pa, max(s0[e], s1[e]))
+            } else {
+                pb = max(pb, max(s0[e], s1[e]))
+            }
+        }
+        pm[w * 128 + g * 4 + lane % 4] = pa
+        pm[w * 128 + 64 + g * 4 + lane % 4] = pb
+        sync()
+        var na = ma
+        var nb = mb
+        for x in 0..4 {
+            na = max(na, pm[w * 128 + g * 4 + x])
+            nb = max(nb, pm[w * 128 + 64 + g * 4 + x])
+        }
+        let ca = exp(ma - na)
+        let cb = exp(mb - nb)
+        ma = na
+        mb = nb
+        la = la * ca
+        lb = lb * cb
+        for e in 0..8 {
+            let top = mma_row(e) == g
+            let nm = if top { na } else { nb }
+            let p0 = exp(s0[e] - nm)
+            let p1 = exp(s1[e] - nm)
+            s0[e] = p0
+            s1[e] = p1
+            let f = if top { ca } else { cb }
+            if top { la += p0 + p1 } else { lb += p0 + p1 }
+            o0[e] = o0[e] * f
+            o1[e] = o1[e] * f
+            o2[e] = o2[e] * f
+            o3[e] = o3[e] * f
+        }
+        mma_store(s0, ss, w * 576, 36)
+        mma_store(s1, ss, w * 576 + 16, 36)
+        sync()
+        for kc in 0..2 {
+                    mma_bf16(o0, ss, w * 576 + kc * 16, 36, vs, kc * 16 * 72, 72)
+                mma_bf16(o1, ss, w * 576 + kc * 16, 36, vs, kc * 16 * 72 + 16, 72)
+                mma_bf16(o2, ss, w * 576 + kc * 16, 36, vs, kc * 16 * 72 + 32, 72)
+                mma_bf16(o3, ss, w * 576 + kc * 16, 36, vs, kc * 16 * 72 + 48, 72)
+            }
+        sync()
+        kt += 32
+    }
+    pm[w * 128 + (lane / 4) * 4 + lane % 4] = la
+    pm[w * 128 + 64 + (lane / 4) * 4 + lane % 4] = lb
+    sync()
+    var sa = 0.0
+    var sb = 0.0
+    for x in 0..4 {
+        sa += pm[w * 128 + (lane / 4) * 4 + x]
+        sb += pm[w * 128 + 64 + (lane / 4) * 4 + x]
+    }
+    for e in 0..8 {
+        let f = if mma_row(e) == lane / 4 { 1.0 / sa } else { 1.0 / sb }
+        o0[e] = o0[e] * f
+        o1[e] = o1[e] * f
+        o2[e] = o2[e] * f
+        o3[e] = o3[e] * f
+    }
+    // (t is a multiple of 64 here, so every row of the tile exists)
+    let ob = base + (r0 + w * 16) * 64
+    mma_store(o0, out, ob, 64)
+    mma_store(o1, out, ob + 16, 64)
+    mma_store(o2, out, ob + 32, 64)
+    mma_store(o3, out, ob + 48, 64)
+}
+
+fn reference(q: tensor<f32>, k: tensor<f32>, v: tensor<f32>, t: i64, scale: f32) -> tensor<f32> {
+    let s = (q @ k.transpose(1, 2)) * scale
+    let mask = tensor.ones([t, t]).tril()
+    let p = softmax(s.masked_fill(mask == 0.0, -1e30), axis: -1)
+    p @ v
+}
+
+
+let (bh, t, d) = (8 * 12, 1024, 64)
+seed(1)
+let q = tensor.randn([bh, t, d]).gpu()
+let k = tensor.randn([bh, t, d]).gpu()
+let v = tensor.randn([bh, t, d]).gpu()
+var out = tensor.zeros([bh, t, d]).gpu()
+let scale = 1.0 / sqrt(d as f64)
+// (t a multiple of 64: every block's 64 rows exist)
+let grid = (t / 64, bh)
+let want = reference(q, k, v, t, scale)
+for bf in [0, 1] {
+    let run = |checked: bool| if bf == 1 { flash_bf16.launch(q, k, v, out, t, scale, grid: grid, block: 128, checked: checked) } else { flash_tf32.launch(q, k, v, out, t, scale, grid: grid, block: 128, checked: checked) }
+    run(true)
+    print(if bf == 1 { "bf16" } else { "tf32" }, "max difference:", (out - want).abs().max().item())
+    run(false)
+    let _ = out.sum().item()
+    // (best of 5 runs of 10 launches)
+    var tf = 1e9
+    for rep in 0..5 {
+        let t0 = clock()
+        for r in 0..10 { run(false) }
+        let _ = out.sum().item()
+        tf = min(tf, (clock() - t0) / 10.0)
+    }
+    // causal attention: about half of 4 * B*H * T * T * D operations
+    print("  {round(tf * 1000.0, 2)} ms, {round(2.0 * bh * t * t * d / tf / 1e12, 2)} TFLOP/s")
+}

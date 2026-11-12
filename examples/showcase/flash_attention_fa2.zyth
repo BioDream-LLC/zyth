@@ -1,0 +1,233 @@
+// FlashAttention-2 (forward, causal, head size 64) written in Zyth, as fast as the CUDA original.
+// bf16 q, k, v, out [heads, t, 64]. A block of 4 warps takes 64 queries (16 a warp, kept in
+// registers); keys and values come in tiles of 64, copied asynchronously into bf16 shared memory
+// (`copy_async`) while the tile before is used (two buffers); `mma_bf16` / `mma_bf16_t` read their
+// operands from shared memory with `ldmatrix`; the softmax runs on the accumulators, row maxima
+// and sums across the 4 threads of a row by `shfl_xor`; and the probabilities go from the
+// accumulators straight into the next product (`mma_a_bf16(acc)`). Rows are padded to 72 values
+// so that the 8 rows `ldmatrix` reads at once sit in different memory banks. Needs an NVIDIA GPU
+// of compute capability 8.0+ for speed; elsewhere it computes the same values, slowly.
+
+// (`sl2` is the scale times log2(e): exp(x * scale) = exp2(x * sl2), one multiply-add and exp2)
+kernel fn flash_fa2(q: tensor<bf16>, k: tensor<bf16>, v: tensor<bf16>, out: mut tensor<bf16>, t: i64, sl2: f32) {
+    var qs = shared(bf16, 4608)         // 64 queries x 64 (+ 8 padding)
+    var ks = shared(bf16, 9216)         // two buffers of 64 keys
+    var vs = shared(bf16, 9216)
+    let tid = thread.x
+    let w = tid / 32
+    let lane = thread.lane
+    let g = lane / 4
+    let r0 = (grid_dim.x - 1 - block.x) * 64      // the blocks with the most keys first
+    let base = block.y * t * 64
+    let ntiles = (min(t, r0 + 64) + 63) / 64
+    // a 64 x 64 tile is 512 runs of 8 values: 4 a thread
+    for u in 0..4 {
+        let c = tid + 128 * u
+        let row = c / 8
+        let col = (c % 8) * 8
+        copy_async(qs, row * 72 + col, q, base + (r0 + row) * 64 + col, 8)
+        copy_async(ks, row * 72 + col, k, base + row * 64 + col, 8)
+        copy_async(vs, row * 72 + col, v, base + row * 64 + col, 8)
+    }
+    copy_commit()
+    if ntiles > 1 {
+        for u in 0..4 {
+            let c = tid + 128 * u
+            let row = c / 8
+            let col = (c % 8) * 8
+            copy_async(ks, 4608 + row * 72 + col, k, base + (64 + row) * 64 + col, 8)
+            copy_async(vs, 4608 + row * 72 + col, v, base + (64 + row) * 64 + col, 8)
+        }
+    }
+    copy_commit()
+    copy_wait(1)
+    sync()
+    let qa0 = mma_a_bf16(qs, w * 16 * 72, 72)
+    let qa1 = mma_a_bf16(qs, w * 16 * 72 + 16, 72)
+    let qa2 = mma_a_bf16(qs, w * 16 * 72 + 32, 72)
+    let qa3 = mma_a_bf16(qs, w * 16 * 72 + 48, 72)
+    let o0 = mma_acc()
+    let o1 = mma_acc()
+    let o2 = mma_acc()
+    let o3 = mma_acc()
+    var ma = -1e30                      // running max and sum of rows g and g + 8 (this thread's part)
+    var mb = -1e30
+    var la = 0.0
+    var lb = 0.0
+    var j = 0
+    while j < ntiles {
+        if j > 0 {
+            copy_wait(1)
+            sync()
+        }
+        let kb = (j % 2) * 4608
+        let kt = j * 64
+        // S = Q K^T: 16 queries x 64 keys, as four 16 x 16 accumulators
+        let s0 = mma_acc()
+        let s1 = mma_acc()
+        let s2 = mma_acc()
+        let s3 = mma_acc()
+        mma_bf16_t(s0, qa0, ks, kb, 72)
+        mma_bf16_t(s1, qa0, ks, kb + 1152, 72)
+        mma_bf16_t(s2, qa0, ks, kb + 2304, 72)
+        mma_bf16_t(s3, qa0, ks, kb + 3456, 72)
+        mma_bf16_t(s0, qa1, ks, kb + 16, 72)
+        mma_bf16_t(s1, qa1, ks, kb + 1168, 72)
+        mma_bf16_t(s2, qa1, ks, kb + 2320, 72)
+        mma_bf16_t(s3, qa1, ks, kb + 3472, 72)
+        mma_bf16_t(s0, qa2, ks, kb + 32, 72)
+        mma_bf16_t(s1, qa2, ks, kb + 1184, 72)
+        mma_bf16_t(s2, qa2, ks, kb + 2336, 72)
+        mma_bf16_t(s3, qa2, ks, kb + 3488, 72)
+        mma_bf16_t(s0, qa3, ks, kb + 48, 72)
+        mma_bf16_t(s1, qa3, ks, kb + 1200, 72)
+        mma_bf16_t(s2, qa3, ks, kb + 2352, 72)
+        mma_bf16_t(s3, qa3, ks, kb + 3504, 72)
+        // the causal mask (and the end of the sequence), only on the tiles that need it
+        if kt + 63 > r0 + w * 16 || kt + 64 > t {
+            for e in 0..8 {
+                let rr = r0 + w * 16 + mma_row(e)
+                let c = kt + mma_col(e)
+                if c > rr || c >= t { s0[e] = -1e30 }
+                if c + 16 > rr || c + 16 >= t { s1[e] = -1e30 }
+                if c + 32 > rr || c + 32 >= t { s2[e] = -1e30 }
+                if c + 48 > rr || c + 48 >= t { s3[e] = -1e30 }
+            }
+        }
+        // row maxima: this thread's 16 values of each of its two rows, then the row's 4 threads
+        var pa = ma
+        var pb = mb
+        for e in 0..8 {
+            let x = max(max(s0[e], s1[e]), max(s2[e], s3[e]))
+            if (e / 2) % 2 == 0 { pa = max(pa, x) } else { pb = max(pb, x) }
+        }
+        let xa1 = shfl_xor(pa, 1)
+        let na1 = max(pa, xa1)
+        let xa2 = shfl_xor(na1, 2)
+        let na = max(na1, xa2)
+        let xb1 = shfl_xor(pb, 1)
+        let nb1 = max(pb, xb1)
+        let xb2 = shfl_xor(nb1, 2)
+        let nb = max(nb1, xb2)
+        let ca = exp2((ma - na) * sl2)
+        let cb = exp2((mb - nb) * sl2)
+        ma = na
+        mb = nb
+        la = la * ca
+        lb = lb * cb
+        for e in 0..8 {
+            let top = (e / 2) % 2 == 0
+            let m = (if top { na } else { nb }) * sl2
+            let f = if top { ca } else { cb }
+            s0[e] = exp2(s0[e] * sl2 - m)
+            s1[e] = exp2(s1[e] * sl2 - m)
+            s2[e] = exp2(s2[e] * sl2 - m)
+            s3[e] = exp2(s3[e] * sl2 - m)
+            let sum = s0[e] + s1[e] + s2[e] + s3[e]
+            if top { la += sum } else { lb += sum }
+            o0[e] = o0[e] * f
+            o1[e] = o1[e] * f
+            o2[e] = o2[e] * f
+            o3[e] = o3[e] * f
+        }
+        // O += P V, P straight from the accumulators
+        let p0 = mma_a_bf16(s0)
+        let p1 = mma_a_bf16(s1)
+        let p2 = mma_a_bf16(s2)
+        let p3 = mma_a_bf16(s3)
+        mma_bf16(o0, p0, vs, kb, 72)
+        mma_bf16(o1, p0, vs, kb + 16, 72)
+        mma_bf16(o2, p0, vs, kb + 32, 72)
+        mma_bf16(o3, p0, vs, kb + 48, 72)
+        mma_bf16(o0, p1, vs, kb + 1152, 72)
+        mma_bf16(o1, p1, vs, kb + 1168, 72)
+        mma_bf16(o2, p1, vs, kb + 1184, 72)
+        mma_bf16(o3, p1, vs, kb + 1200, 72)
+        mma_bf16(o0, p2, vs, kb + 2304, 72)
+        mma_bf16(o1, p2, vs, kb + 2320, 72)
+        mma_bf16(o2, p2, vs, kb + 2336, 72)
+        mma_bf16(o3, p2, vs, kb + 2352, 72)
+        mma_bf16(o0, p3, vs, kb + 3456, 72)
+        mma_bf16(o1, p3, vs, kb + 3472, 72)
+        mma_bf16(o2, p3, vs, kb + 3488, 72)
+        mma_bf16(o3, p3, vs, kb + 3504, 72)
+        // this buffer is free again: the tile after next goes into it
+        sync()
+        if j + 2 < ntiles {
+            for u in 0..4 {
+                let c = tid + 128 * u
+                let row = c / 8
+                let col = (c % 8) * 8
+                copy_async(ks, kb + row * 72 + col, k, base + (kt + 128 + row) * 64 + col, 8)
+                copy_async(vs, kb + row * 72 + col, v, base + (kt + 128 + row) * 64 + col, 8)
+            }
+        }
+        copy_commit()
+        j += 1
+    }
+    let ya1 = shfl_xor(la, 1)
+    let sa1 = la + ya1
+    let ya2 = shfl_xor(sa1, 2)
+    let sa = sa1 + ya2
+    let yb1 = shfl_xor(lb, 1)
+    let sb1 = lb + yb1
+    let yb2 = shfl_xor(sb1, 2)
+    let sb = sb1 + yb2
+    for e in 0..8 {
+        let inv = if (e / 2) % 2 == 0 { 1.0 / sa } else { 1.0 / sb }
+        o0[e] = o0[e] * inv
+        o1[e] = o1[e] * inv
+        o2[e] = o2[e] * inv
+        o3[e] = o3[e] * inv
+    }
+    let ob = base + (r0 + w * 16) * 64
+    mma_store(o0, out, ob, 64)
+    mma_store(o1, out, ob + 16, 64)
+    mma_store(o2, out, ob + 32, 64)
+    mma_store(o3, out, ob + 48, 64)
+}
+
+fn reference(q: tensor<f32>, k: tensor<f32>, v: tensor<f32>, t: i64, scale: f32) -> tensor<f32> {
+    let s = (q @ k.transpose(1, 2)) * scale
+    let mask = tensor.ones([t, t]).tril()
+    let p = softmax(s.masked_fill(mask == 0.0, -1e30), axis: -1)
+    p @ v
+}
+
+let (bh, t, d) = (8 * 12, 1024, 64)
+seed(1)
+let q = tensor.randn([bh, t, d]).gpu().to(bf16)
+let k = tensor.randn([bh, t, d]).gpu().to(bf16)
+let v = tensor.randn([bh, t, d]).gpu().to(bf16)
+var out = tensor.zeros([bh, t, d]).gpu().to(bf16)
+let scale = 1.0 / sqrt(d as f64)
+// (t a multiple of 64: every block's 64 rows exist)
+let grid = (t / 64, bh)
+let want = reference(q.to(f32), k.to(f32), v.to(f32), t, scale)
+let sl2 = scale * 1.4426950408889634
+flash_fa2.launch(q, k, v, out, t, sl2, grid: grid, block: 128)
+print("max difference:", (out.to(f32) - want).abs().max().item())
+let run = || flash_fa2.launch(q, k, v, out, t, sl2, grid: grid, block: 128, checked: false)
+run()
+let _ = out.to(f32).sum().item()
+// (best of 5 runs of 20 launches)
+var tf = 1e9
+for rep in 0..5 {
+    let t0 = clock()
+    for r in 0..20 { run() }
+    let _ = out.to(f32).sum().item()
+    tf = min(tf, (clock() - t0) / 20.0)
+}
+// causal attention: about half of 4 * B*H * T * T * D operations
+print("  {round(tf * 1000.0, 3)} ms, {round(2.0 * bh * t * t * d / tf / 1e12, 1)} TFLOP/s")
+// the built-in attention (its own CUDA kernel), on the same data packed as qkv
+let qkv = tensor.concat([q.reshape([8, 12, t, d]).transpose(1, 2), k.reshape([8, 12, t, d]).transpose(1, 2), v.reshape([8, 12, t, d]).transpose(1, 2)], axis: 2).reshape([8, t, 3 * 12 * d])
+let _ = attention(qkv, heads: 12, causal: true).to(f32).sum().item()
+var tb = 1e9
+for rep in 0..5 {
+    let t0 = clock()
+    for r in 0..20 { let _ = attention(qkv, heads: 12, causal: true) }
+    let _ = attention(qkv, heads: 12, causal: true).to(f32).sum().item()
+    tb = min(tb, (clock() - t0) / 21.0)
+}
+print("  built-in attention: {round(tb * 1000.0, 3)} ms")

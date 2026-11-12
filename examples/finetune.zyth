@@ -1,0 +1,24 @@
+// Fine-tune and align a pretrained model (spec Section 19.1).
+//
+//   cd examples && zyth run finetune.zyth
+//
+// Downloads Llama-3.2-1B (~2.5 GB) once and needs a GPU with about 12 GB.
+// For a quick run on a small GPU, use "HuggingFaceTB/SmolLM2-135M" with lr: 2e-3.
+use zyth.train.{sft, dpo, lora}
+
+let name  = "unsloth/Llama-3.2-1B"
+let base  = hub.load(name).to(gpu)
+let tuned = sft(base,
+    data: jsonl("finetune/instructions.jsonl", prompt: "instruction", response: "output"),
+    adapter: lora(rank: 16, targets: [q_proj, v_proj]),
+    lr: 2e-4, epochs: 3)
+
+let aligned = dpo(tuned, reference: base,
+    data: jsonl("finetune/prefs.jsonl", prompt: "q", chosen: "good", rejected: "bad"),
+    beta: 0.1, adapter: lora(rank: 16))
+
+aligned.save("aligned.zyth.model")
+
+let tok = hub.tokenizer(name)
+let q = tok.encode("Explain in one line: what is Cranelift?\n")
+print(tok.decode(aligned.generate(q, max_tokens: 24, temperature: 0.0, stop: tok.eos_id ?? -1)[q.len():]))

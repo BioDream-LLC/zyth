@@ -1,0 +1,23 @@
+{
+  "name": "zyth",
+  "displayName": "Zyth",
+  "description": "Zyth language support: syntax highlighting, diagnostics, inline tensor shapes, and quick fixes (via `zyth lsp`).",
+  "version": "0.1.0",
+  "publisher": "biodream",
+  "license": "Apache-2.0 OR MIT",
+  "engines": { "vscode": "^1.85.0" },
+  "categories": ["Programming Languages"],
+  "main": "./extension.js",
+  "activationEvents": ["onLanguage:zyth"],
+  "contributes": {
+    "languages": [{ "id": "zyth", "aliases": ["Zyth"], "extensions": [".zyth", ".zyi"], "configuration": "./language-configuration.json" }],
+    "grammars": [{ "language": "zyth", "scopeName": "source.zyth", "path": "./syntaxes/zyth.tmLanguage.json" }],
+    "configuration": {
+      "title": "Zyth",
+      "properties": {
+        "zyth.path": { "type": "string", "default": "zyth", "description": "Path to the zyth executable." }
+      }
+    }
+  },
+  "dependencies": { "vscode-languageclient": "9.0.1" }
+}

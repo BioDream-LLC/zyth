@@ -1,0 +1,385 @@
+/// Reference architectures (module `zyth.nn.arch`).
+///
+/// Field names follow the Hugging Face checkpoints, so pretrained weights load
+/// by name: `hub.load("gpt2")` builds a `GPT2` and fills it from
+/// `model.safetensors`.
+
+use zyth.nn.{sample_token}
+
+/// GPT-2's "Conv1D": a linear layer whose weight is stored as [in, out].
+pub model Conv1D(in_features: i64, out_features: i64) {
+    weight: tensor<f32, [in_features, out_features]> = tensor.randn(in_features, out_features) * 0.02
+    bias: tensor<f32, [out_features]> = tensor.zeros(out_features)
+
+    fn forward(self, x: tensor<f32, [..., in_features]>) -> tensor<f32, [..., out_features]> = x @ self.weight + self.bias
+}
+
+/// Causal multi-head self-attention with a fused `c_attn` projection (GPT-2 layout).
+pub model GPT2Attention(dim: i64, heads: i64) {
+    c_attn = Conv1D(dim -> 3 * dim)
+    c_proj = Conv1D(dim -> dim)
+
+    fn forward(self, x: tensor<f32, [B, T, dim]>) -> tensor<f32, [B, T, dim]> {
+        return self.c_proj(attention(self.c_attn(x), heads: heads, causal: true))
+    }
+
+    /// Attention for new positions with cached `Some((keys, values))` (`None` at first). Returns `(y, keys, values)`.
+    fn forward_cached(self, x, past) {
+        let b = x.shape[0]
+        let t = x.shape[1]
+        let hd = dim / heads
+        let parts = self.c_attn(x).split([dim, dim, dim], axis: -1)
+        let q = parts[0].reshape(b, t, heads, hd).transpose(1, 2)
+        let k_new = parts[1].reshape(b, t, heads, hd).transpose(1, 2)
+        let v_new = parts[2].reshape(b, t, heads, hd).transpose(1, 2)
+        let (k, v, n_past) = match past {
+            Some((pk, pv)) => (concat([pk, k_new], axis: 2), concat([pv, v_new], axis: 2), pk.shape[2])
+            None           => (k_new, v_new, 0)
+        }
+        var att = (q @ k.transpose(-2, -1)) * (1.0 / sqrt(hd as f64))
+        if t > 1 {
+            att = att.masked_fill(tensor.causal_mask(t, offset: n_past, device: x.device), -1e9)
+        }
+        let y = (softmax(att, axis: -1) @ v).transpose(1, 2).reshape(b, t, dim)
+        return (self.c_proj(y), k, v)
+    }
+}
+
+/// The feed-forward block: `c_fc` (dim -> 4·dim), GELU, `c_proj` (4·dim -> dim).
+pub model GPT2MLP(dim: i64) {
+    c_fc = Conv1D(dim -> 4 * dim)
+    c_proj = Conv1D(4 * dim -> dim)
+
+    fn forward(self, x) = self.c_proj(gelu(self.c_fc(x)))
+}
+
+/// A pre-norm transformer block: `x + attn(ln_1(x))`, then `x + mlp(ln_2(x))`.
+pub model GPT2Block(dim: i64, heads: i64) {
+    ln_1 = LayerNorm(dim)
+    attn = GPT2Attention(dim, heads)
+    ln_2 = LayerNorm(dim)
+    mlp = GPT2MLP(dim)
+
+    fn forward(self, x: tensor<f32, [B, T, dim]>) -> tensor<f32, [B, T, dim]> {
+        let h = x + self.attn(self.ln_1(x))
+        return h + self.mlp(self.ln_2(h))
+    }
+
+    fn forward_cached(self, x, past) {
+        let (a, k, v) = self.attn.forward_cached(self.ln_1(x), past)
+        let h = x + a
+        return (h + self.mlp(self.ln_2(h)), k, v)
+    }
+}
+
+/// GPT-2 (Radford et al., 2019). The output layer shares weights with `wte`.
+pub model GPT2(layers: i64 = 12, heads: i64 = 12, dim: i64 = 768, vocab: i64 = 50257, context: i64 = 1024) {
+    wte = Embedding(vocab -> dim)
+    wpe = Embedding(context -> dim)
+    h = (0..layers).map(|_| GPT2Block(dim, heads))
+    ln_f = LayerNorm(dim)
+
+    /// Final hidden states `[B, T, dim]`.
+    fn hidden(self, ids: tensor<i64, [B, T]>) -> tensor<f32, [B, T, dim]> {
+        let t = ids.shape[1]
+        var x = self.wte(ids) + self.wpe(tensor.arange(t))
+        for block in self.h {
+            x = block(x)
+        }
+        return self.ln_f(x)
+    }
+
+    fn forward(self, ids: tensor<i64, [B, T]>) -> tensor<f32, [B, T, vocab]> = self.hidden(ids) @ self.wte.weight.T
+
+    /// `n` continuations of `prompt` sampled together; each stops after `stop` (if given) or `max_tokens`.
+    /// Returns the new tokens of each continuation (including `stop`). The prompt plus the new tokens must fit in `context`.
+    fn generate_batch(self, prompt, n: i64 = 1, max_tokens: i64 = 40, temperature: f64 = 0.8, top_k: i64 = 40, stop: i64 = -1) -> i64[][] {
+        var outs = (0..n).map(|_| [])
+        var done = (0..n).map(|_| false)
+        let p = list(prompt)
+        let steps = min(max_tokens, context - p.len())
+        no_grad {
+            var ks = []
+            var vs = []
+            var pos = 0
+            var input = tensor.from((0..n).map(|_| p))
+            for _ in 0..steps {
+                let t = input.shape[1]
+                var x = self.wte(input) + self.wpe(tensor.arange(pos, pos + t))
+                var i = 0
+                for block in self.h {
+                    let cached = i < ks.len()
+                    let (hh, k, v) = block.forward_cached(x, if cached { Some((ks[i], vs[i])) } else { None })
+                    if cached {
+                        ks[i] = k
+                        vs[i] = v
+                    } else {
+                        ks.push(k)
+                        vs.push(v)
+                    }
+                    x = hh
+                    i += 1
+                }
+                pos += t
+                let last = self.ln_f(x)[.., -1] @ self.wte.weight.T
+                var next = []
+                for r in 0..n {
+                    let tok = sample_token(last[r], temperature: temperature, top_k: top_k)
+                    if !done[r] {
+                        outs[r].push(tok)
+                        if tok == stop {
+                            done[r] = true
+                        }
+                    }
+                    next.push([tok])
+                }
+                if done.all(|d| d) {
+                    break
+                }
+                input = tensor.from(next)
+            }
+        }
+        return outs
+    }
+
+    /// Sample `max_tokens` new token ids after `prompt` with temperature and top-k sampling.
+    fn generate(self, prompt, max_tokens: i64 = 40, temperature: f64 = 0.8, top_k: i64 = 40) -> i64[] {
+        var ids = list(prompt)
+        no_grad {
+            // keys and values of earlier positions are cached per layer
+            var ks = []
+            var vs = []
+            var pos = 0
+            var input = ids[max(0, ids.len() - context):]
+            for _ in 0..max_tokens {
+                if pos + input.len() > context {
+                    ks = []
+                    vs = []
+                    pos = 0
+                    input = ids[ids.len() - context / 2:]
+                }
+                let n = input.len()
+                var x = self.wte(tensor.from([input])) + self.wpe(tensor.arange(pos, pos + n))
+                var i = 0
+                for block in self.h {
+                    let cached = i < ks.len()
+                    let (hh, k, v) = block.forward_cached(x, if cached { Some((ks[i], vs[i])) } else { None })
+                    if cached {
+                        ks[i] = k
+                        vs[i] = v
+                    } else {
+                        ks.push(k)
+                        vs.push(v)
+                    }
+                    x = hh
+                    i += 1
+                }
+                pos += n
+                let last = self.ln_f(x)[0, -1] @ self.wte.weight.T
+                // temperature 0 (or below) means greedy decoding
+                let next = if temperature <= 0.0 {
+                    last.argmax()
+                } else {
+                    let (vals, idx) = (last / temperature).topk(top_k)
+                    idx[softmax(vals).multinomial().item()].item()
+                }
+                ids.push(next)
+                input = [next]
+            }
+        }
+        return ids
+    }
+}
+
+/// Rotary-embedding inverse frequencies for a head of size `head_dim`, with
+/// Llama 3 frequency scaling when `factor` > 1.
+pub fn rope_frequencies(head_dim: i64, theta: f64, factor: f64 = 1.0, low: f64 = 1.0, high: f64 = 4.0, original: i64 = 8192) -> f64[] {
+    var fs = []
+    for i in 0..head_dim / 2 {
+        var f = 1.0 / pow(theta, (2 * i) as f64 / head_dim as f64)
+        if factor > 1.0 {
+            let wavelen = 2.0 * PI / f
+            let low_wavelen = original as f64 / low
+            let high_wavelen = original as f64 / high
+            if wavelen > low_wavelen {
+                f = f / factor
+            } else if wavelen >= high_wavelen {
+                let smooth = (original as f64 / wavelen - low) / (high - low)
+                f = (1.0 - smooth) * f / factor + smooth * f
+            }
+        }
+        fs.push(f)
+    }
+    return fs
+}
+
+/// Rotate `x` `[B, H, T, D]` by the rotary tables `cos`/`sin` `[T, D]` (rotate-half layout).
+fn rotate_half(x, cos, sin) = x.rotary(cos, sin)
+
+/// Repeat each of the key/value heads of `x` `[B, kv, T, D]` `rep` times (grouped-query attention).
+fn repeat_kv(x, rep: i64) {
+    if rep == 1 {
+        return x
+    }
+    let s = x.shape
+    return x.unsqueeze(2).expand(s[0], s[1], rep, s[2], s[3]).reshape(s[0], s[1] * rep, s[2], s[3])
+}
+
+/// Grouped-query self-attention with rotary position embeddings (Llama layout).
+pub model LlamaAttention(dim: i64, heads: i64, kv_heads: i64, head_dim: i64, bias: bool = false) {
+    q_proj = Linear(dim -> heads * head_dim, bias: bias)
+    k_proj = Linear(dim -> kv_heads * head_dim, bias: bias)
+    v_proj = Linear(dim -> kv_heads * head_dim, bias: bias)
+    o_proj = Linear(heads * head_dim -> dim, bias: false)
+
+    /// Attention for new positions given `past = Some((keys, values))` or `None`. Returns `(y, keys, values)`.
+    fn forward_cached(self, x, cos, sin, past) {
+        let b = x.shape[0]
+        let t = x.shape[1]
+        let q = rotate_half(self.q_proj(x).reshape(b, t, heads, head_dim).transpose(1, 2), cos, sin)
+        let k_new = rotate_half(self.k_proj(x).reshape(b, t, kv_heads, head_dim).transpose(1, 2), cos, sin)
+        let v_new = self.v_proj(x).reshape(b, t, kv_heads, head_dim).transpose(1, 2)
+        let (k, v, n_past) = match past {
+            Some((pk, pv)) => (concat([pk, k_new], axis: 2), concat([pv, v_new], axis: 2), pk.shape[2])
+            None           => (k_new, v_new, 0)
+        }
+        let rep = heads / kv_heads
+        var att = (q @ repeat_kv(k, rep).transpose(-2, -1)) * (1.0 / sqrt(head_dim as f64))
+        if t > 1 {
+            att = att.masked_fill(tensor.causal_mask(t, offset: n_past, device: x.device), -1e9)
+        }
+        let y = (softmax(att, axis: -1) @ repeat_kv(v, rep)).transpose(1, 2).reshape(b, t, heads * head_dim)
+        return (self.o_proj(y), k, v)
+    }
+
+    fn forward(self, x, cos, sin) {
+        let (y, _, _) = self.forward_cached(x, cos, sin, None)
+        return y
+    }
+}
+
+/// The gated feed-forward block: `down_proj(silu(gate_proj(x)) * up_proj(x))`.
+pub model LlamaMLP(dim: i64, hidden: i64) {
+    gate_proj = Linear(dim -> hidden, bias: false)
+    up_proj = Linear(dim -> hidden, bias: false)
+    down_proj = Linear(hidden -> dim, bias: false)
+
+    fn forward(self, x) = self.down_proj(silu(self.gate_proj(x)) * self.up_proj(x))
+}
+
+/// A pre-norm Llama decoder layer (RMSNorm, attention, RMSNorm, gated MLP).
+pub model LlamaBlock(dim: i64, heads: i64, kv_heads: i64, head_dim: i64, hidden: i64, eps: f64, bias: bool) {
+    input_layernorm = RMSNorm(dim, eps: eps)
+    self_attn = LlamaAttention(dim, heads, kv_heads, head_dim, bias: bias)
+    post_attention_layernorm = RMSNorm(dim, eps: eps)
+    mlp = LlamaMLP(dim, hidden)
+
+    fn forward_cached(self, x, cos, sin, past) {
+        let (a, k, v) = self.self_attn.forward_cached(self.input_layernorm(x), cos, sin, past)
+        let h = x + a
+        return (h + self.mlp(self.post_attention_layernorm(h)), k, v)
+    }
+}
+
+/// Llama-family decoder (Llama 2/3, SmolLM, TinyLlama, Mistral, Qwen2 with `bias: true`).
+/// Field names follow the Hugging Face checkpoints (without the `model.` prefix).
+pub model Llama(layers: i64 = 16, heads: i64 = 32, kv_heads: i64 = 8, dim: i64 = 2048, hidden: i64 = 8192, vocab: i64 = 128256, context: i64 = 8192, theta: f64 = 500000.0, eps: f64 = 1e-5, tied: bool = true, bias: bool = false, head_dim: i64 = 0, rope_factor: f64 = 1.0, rope_low: f64 = 1.0, rope_high: f64 = 4.0, rope_original: i64 = 8192) {
+    embed_tokens = Embedding(vocab -> dim)
+    layers = (0..layers).map(|_| LlamaBlock(dim, heads, kv_heads, if head_dim > 0 { head_dim } else { dim / heads }, hidden, eps, bias))
+    norm = RMSNorm(dim, eps: eps)
+    lm_head = if tied { None } else { Some(Linear(dim -> vocab, bias: false)) }
+    inv_freq = rope_frequencies(if head_dim > 0 { head_dim } else { dim / heads }, theta, factor: rope_factor, low: rope_low, high: rope_high, original: rope_original)
+
+    /// Rotary tables `(cos, sin)` `[n, head_dim]` for positions `pos..pos + n`.
+    fn rope(self, pos: i64, n: i64, device) {
+        let freqs = tensor.arange(pos, pos + n).to(f32).unsqueeze(1) * tensor.from(self.inv_freq).to(f32).unsqueeze(0)
+        let emb = concat([freqs, freqs], axis: -1).to(device)
+        return (emb.cos(), emb.sin())
+    }
+
+    /// Output logits for hidden states `h` (shared with `embed_tokens` when `tied`).
+    fn logits(self, h) {
+        return match self.lm_head {
+            Some(head) => head(h)
+            None       => h @ self.embed_tokens.weight.T
+        }
+    }
+
+    /// Final hidden states `[B, T, dim]`.
+    fn hidden(self, ids: tensor<i64, [B, T]>) -> tensor<f32, [B, T, dim]> {
+        let (cos, sin) = self.rope(0, ids.shape[1], self.embed_tokens.weight.device)
+        var x = self.embed_tokens(ids)
+        for block in self.layers {
+            let (h, _, _) = block.forward_cached(x, cos, sin, None)
+            x = h
+        }
+        return self.norm(x)
+    }
+
+    fn forward(self, ids: tensor<i64, [B, T]>) -> tensor<f32, [B, T, vocab]> = self.logits(self.hidden(ids))
+
+    /// `n` continuations of `prompt` sampled together; each stops after `stop` (if given) or `max_tokens`.
+    /// Returns the new tokens of each continuation (including `stop`).
+    fn generate_batch(self, prompt, n: i64 = 1, max_tokens: i64 = 40, temperature: f64 = 0.8, top_k: i64 = 40, stop: i64 = -1) -> i64[][] {
+        var outs = (0..n).map(|_| [])
+        var done = (0..n).map(|_| false)
+        no_grad {
+            var ks = []
+            var vs = []
+            var pos = 0
+            let dev = self.embed_tokens.weight.device
+            var input = tensor.from((0..n).map(|_| list(prompt)))
+            for _ in 0..max_tokens {
+                let t = input.shape[1]
+                let (cos, sin) = self.rope(pos, t, dev)
+                var x = self.embed_tokens(input.to(dev))
+                var i = 0
+                for block in self.layers {
+                    let cached = i < ks.len()
+                    let (hh, k, v) = block.forward_cached(x, cos, sin, if cached { Some((ks[i], vs[i])) } else { None })
+                    if cached {
+                        ks[i] = k
+                        vs[i] = v
+                    } else {
+                        ks.push(k)
+                        vs.push(v)
+                    }
+                    x = hh
+                    i += 1
+                }
+                pos += t
+                let last = self.logits(self.norm(x)[.., -1])
+                var next = []
+                for r in 0..n {
+                    let tok = sample_token(last[r], temperature: temperature, top_k: top_k)
+                    if !done[r] {
+                        outs[r].push(tok)
+                        if tok == stop {
+                            done[r] = true
+                        }
+                    }
+                    next.push([tok])
+                }
+                if done.all(|d| d) {
+                    break
+                }
+                input = tensor.from(next)
+            }
+        }
+        return outs
+    }
+
+    /// Sample `max_tokens` new token ids after `prompt` (stopping early after `stop`, if given).
+    /// On an NVIDIA GPU this runs on the native engine (`llm.engine`), rebuilt when the weights change.
+    fn generate(self, prompt, max_tokens: i64 = 40, temperature: f64 = 0.8, top_k: i64 = 40, stop: i64 = -1) -> i64[] {
+        match llm.try_generate(self, list(prompt), max_tokens: max_tokens, temperature: temperature, top_k: top_k, stop: stop) {
+            Some(fast) => return fast
+            None => {}
+        }
+        var ids = list(prompt)
+        for tok in self.generate_batch(prompt, n: 1, max_tokens: max_tokens, temperature: temperature, top_k: top_k, stop: stop)[0] {
+            ids.push(tok)
+        }
+        return ids
+    }
+}

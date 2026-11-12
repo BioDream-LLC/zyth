@@ -1,0 +1,44 @@
+// A React component written in Zyth: zyth build --target npm-jsx counter.zyth -o counter
+// then, in a React app: import { Counter } from "counter"; <Counter label="Clicks" start={2} />
+use zyth.react.{div, h1, button, ul, li, p, use_state, Element}
+
+struct Todo {
+    text: str
+    done: bool
+}
+
+fn summary(todos: list<Todo>) -> str {
+    var n = 0
+    for t in todos {
+        if t.done { n += 1 }
+    }
+    return "{n} of {len(todos)} done"
+}
+
+/// A counter with a list of items.
+@export
+fn Counter(label: str, start: i64 = 0) -> Element {
+    let (count, set_count) = use_state(start)
+    let (todos, set_todos) = use_state([Todo { text: "write Zyth", done: true }])
+    return div(class: "counter") {
+        h1 { "{label}: {count}" }
+        button(on_click: || set_count(count + 1)) { "+1" }
+        button(on_click: || {
+            var next = todos
+            next.push(Todo { text: "item {count}", done: count % 2 == 0 })
+            set_todos(next)
+        }) { "add" }
+        p { summary(todos) }
+        ul {
+            for t in todos {
+                li(key: t.text, class: if t.done { "done" } else { "open" }) { t.text }
+            }
+        }
+        if count > 3 {
+            p { "more than three" }
+        }
+    }
+}
+
+@export
+fn App() -> Element = div { Counter(label: "Clicks") }

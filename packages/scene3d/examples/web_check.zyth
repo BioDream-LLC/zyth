@@ -1,0 +1,11 @@
+use zyth.gfx
+use scene3d.{Scene, Orbit, cube, sphere, plane}
+let s = gfx.window(title: "scene3d", width: 320, height: 240)
+var scene = Scene.new(s)
+scene.add(cube(), color: [1.0, 0.55, 0.2], at: [0.0, 0.5, 0.0])
+scene.add(sphere(), color: [0.3, 0.6, 1.0], at: [1.4, 0.5, 0.0], size: 0.8)
+scene.add(plane(), color: [0.5, 0.5, 0.5], size: 6.0)
+var orbit = Orbit.new(distance: 6.0)
+let n = s.run(frames: 10, clear: [0.05, 0.05, 0.08, 1.0]) { f -> scene.draw(f, orbit.view(), aspect: f.aspect) }
+let px = s.read()
+print("frames {n}, cube {px[110, 160].tolist()}, sky {px[5, 5].tolist()}")

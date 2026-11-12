@@ -1,0 +1,35 @@
+// Structured concurrency: a pipeline of tasks connected by channels, and a
+// scope that waits for (and cancels on error) every task it started.
+fn is_prime(n: i64) -> bool {
+    if n < 2 { return false }
+    var d = 2
+    while d * d <= n {
+        if n % d == 0 { return false }
+        d += 1
+    }
+    return true
+}
+
+let jobs = channel(64)
+let results = channel()
+let workers = 8
+var t = clock()
+scope {
+    go {
+        for start in 0..200 { jobs.send(start * 5000) }
+        jobs.close()
+    }
+    for _ in 0..workers {
+        go {
+            for start in jobs {
+                var c = 0
+                for n in start..start + 5000 { if is_prime(n) { c += 1 } }
+                results.send(c)
+            }
+        }
+    }
+}
+results.close()
+var total = 0
+for c in results { total += c }
+print("primes below 1,000,000:", total, "with {workers} workers in {(clock() - t) * 1000.0:.0f} ms")

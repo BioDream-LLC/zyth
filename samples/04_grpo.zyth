@@ -1,0 +1,14 @@
+// Reinforcement learning from a reward function (GRPO): a two-letter character
+// model learns to answer with as many "a"s as it can.
+use zyth.nn.Transformer
+use zyth.data.text
+use zyth.train.{grpo}
+
+seed(4)
+let tok = text.tokenizer("char")
+tok.fit("ab\n")
+let model = Transformer(layers: 1, heads: 1, dim: 16, vocab: 3, context: 32)
+fn share_of_a(example, completion: str) -> f64 = if completion.len() == 0 { 0.0 } else { completion.count("a") as f64 / completion.len() as f64 }
+let (trained, rewards) = grpo(model, ["a", "b", "ab", "ba"], share_of_a, tokenizer: tok, group: 8, steps: 40, batch: 2, max_tokens: 8, lr: 1e-2, stop: 0, log_every: 10, history: true)
+print("mean reward: first 5 steps {rewards[:5].sum() / 5.0:.2f}, last 5 {rewards[-5:].sum() / 5.0:.2f}")
+print("greedy answer to \"b\":", tok.decode(trained.generate_batch(tok.encode("b"), n: 1, max_tokens: 8, temperature: 0.0, stop: 0)[0]).trim())

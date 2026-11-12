@@ -1,0 +1,45 @@
+/// React components written in Zyth (module `zyth.react`), compiled to JavaScript by
+/// `zyth build --target npm-jsx`: each `@export` function that returns an `Element` becomes a
+/// React component, and its parameters its props.
+///
+///     use zyth.react.{div, h1, button, use_state, Element}
+///
+///     @export
+///     fn Counter(label: str, start: i64 = 0) -> Element {
+///         let (count, set_count) = use_state(start)
+///         return div(class: "counter") {
+///             h1 { "{label}: {count}" }
+///             button(on_click: || set_count(count + 1)) { "+1" }
+///         }
+///     }
+///
+/// Elements are HTML tags (every element of the HTML standard but the document's own and `var`)
+/// and SVG tags (`linear_gradient`, `clip_path`, ... for linearGradient, clipPath) called with
+/// props as named arguments (`class`, `on_click`, `aria_label`, `stroke_width` become className,
+/// onClick, aria-label, strokeWidth) and a trailing block of children: each value in the block
+/// is a child, and `for` and `if` inside it add children. A component with a parameter
+/// `children: Element` gets the block it is called with. Hooks: `use_state`,
+/// `use_effect(run, deps:)`, `use_layout_effect`, `use_memo(make, deps:)`, `use_callback`,
+/// `use_ref(initial)`, `use_reducer(step, first)` (state and a dispatch checked against the
+/// reducer's action type), `use_id()`, `use_transition()` (pending, start), `use_deferred_value`.
+/// Context: `let theme = create_context("light")` at the top, `provider(theme, value: "dark")
+/// { ... }` around children, `use_context(theme)` (typed by the default). react-redux:
+/// `use_selector(|s| s.count)` and `use_dispatch()` (the package then names react-redux as a
+/// peer dependency).
+/// `use_async(make, deps:)` runs `make` after rendering and gives `None` until its value
+/// arrives, then the value (it keeps the last value while `deps` changes bring a new one).
+///
+/// Functions that need tensors, models or anything else JavaScript output does not have run in
+/// WebAssembly (the light or full zyth.wasm from the shared runtime package, with WebGPU when
+/// there is one). Their calls take time, so a component calls them in `use_async` or in an event handler
+/// (`on_click: || set_label(classify(text))`), never while rendering.
+/// `use_frame(|t| draw(t))` calls `draw` at every animation frame (`t`: seconds since the
+/// component appeared), the next only after the last finished. With `zyth.gfx`, a window made
+/// with `gfx.window(..., host: "id")` puts its canvas into the element with that id, so a
+/// component renders `div(id: "id")` and draws one frame (`s.frame { f -> ... }`) per call.
+/// These run only in JavaScript; `zyth run` refuses them.
+
+/// A React element.
+pub struct Element {
+    tag: str
+}

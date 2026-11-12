@@ -1,0 +1,80 @@
+// Monte Carlo option pricing on the GPU, in Zyth: a European call and an Asian (average-price)
+// call on one stock, from millions of simulated price paths, each thread following its own
+// paths with its own random numbers. The European price is checked against the Black-Scholes
+// formula; the same kernel runs on NVIDIA (CUDA), in browsers (WebGPU) and on the CPU.
+
+// one path's random numbers: a 31-bit linear congruential step (the same bits whether integers
+// are 32 or 64 bits wide), mixed, then two of them made into one normal value (Box-Muller)
+kernel fn paths(out_eu: mut tensor<f32>, out_as: mut tensor<f32>, per_thread: i64, steps: i64, s0: f32, strike: f32, rate: f32, vol: f32, years: f32, seed: i64) {
+    let i = thread.global
+    if i < out_eu.len() {
+        var st = (i * 747796405 + seed * 2891336453 + 1) & 2147483647
+        let dt = years / steps
+        let drift = (rate - 0.5 * vol * vol) * dt
+        let shock = vol * sqrt(dt)
+        var sum_eu = 0.0
+        var sum_as = 0.0
+        for p in 0..per_thread {
+            var s = s0
+            var avg = 0.0
+            for k in 0..steps {
+                st = (st * 1103515245 + 12345) & 2147483647
+                let m1 = (st ^ (st >> 13)) & 2147483647
+                st = (st * 1103515245 + 12345) & 2147483647
+                let m2 = (st ^ (st >> 13)) & 2147483647
+                let u1 = (m1 + 1) / 2147483648.0
+                let u2 = m2 / 2147483648.0
+                let z = sqrt(-2.0 * log(u1)) * cos(6.2831853 * u2)
+                s = s * exp(drift + shock * z)
+                avg += s
+            }
+            avg = avg / steps
+            sum_eu += if s > strike { s - strike } else { 0.0 }
+            sum_as += if avg > strike { avg - strike } else { 0.0 }
+        }
+        out_eu[i] = sum_eu
+        out_as[i] = sum_as
+    }
+}
+
+// the normal distribution's CDF (Abramowitz and Stegun 26.2.17, error under 7.5e-8)
+fn normal_cdf(x: f64) -> f64 {
+    let t = 1.0 / (1.0 + 0.2316419 * x.abs())
+    let poly = t * (0.319381530 + t * (-0.356563782 + t * (1.781477937 + t * (-1.821255978 + t * 1.330274429))))
+    let tail = math.exp(-0.5 * x * x) / math.sqrt(2.0 * math.pi) * poly
+    return if x >= 0.0 { 1.0 - tail } else { tail }
+}
+
+fn black_scholes(s0: f64, k: f64, r: f64, v: f64, t: f64) -> f64 {
+    let d1 = (math.log(s0 / k) + (r + 0.5 * v * v) * t) / (v * math.sqrt(t))
+    let d2 = d1 - v * math.sqrt(t)
+    return s0 * normal_cdf(d1) - k * math.exp(-r * t) * normal_cdf(d2)
+}
+
+let args = args()
+let on_cpu = args.contains("--cpu")
+let threads = if on_cpu { 4096 } else { 65536 }
+let per_thread = if on_cpu { 4 } else { 64 }
+let steps = 64
+let (s0, strike, rate, vol, years) = (100.0, 105.0, 0.05, 0.2, 1.0)
+let dev = if on_cpu { cpu } else { gpu }
+var eu = tensor.zeros([threads]).to(dev)
+var asian = tensor.zeros([threads]).to(dev)
+paths.launch(eu, asian, per_thread, steps, s0, strike, rate, vol, years, 1, threads: threads, block: 256)
+let _ = eu.sum().item()
+let t0 = clock()
+let runs = if on_cpu { 1 } else { 5 }
+for r in 0..runs {
+    paths.launch(eu, asian, per_thread, steps, s0, strike, rate, vol, years, r + 2, threads: threads, block: 256)
+}
+let total_eu = eu.sum().item()
+let ms = (clock() - t0) * 1000.0 / runs
+let n = threads * per_thread
+let disc = math.exp(-rate * years)
+let price_eu = disc * total_eu / n
+let price_as = disc * asian.sum().item() / n
+let exact = black_scholes(s0, strike, rate, vol, years)
+print("{n} paths of {steps} steps on the {if on_cpu { "CPU" } else { "GPU" }}: {ms:.1f} ms")
+print("European call {price_eu:.4f} (Black-Scholes {exact:.4f}, off by {(price_eu - exact).abs():.4f})")
+print("Asian call    {price_as:.4f}")
+print("{(n * steps) / (ms / 1000.0) / 1e6:.0f} million path steps a second")

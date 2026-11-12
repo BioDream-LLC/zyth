@@ -1,0 +1,279 @@
+//! scene3d: 3D scenes on zyth.gfx, in plain Zyth (spec §19.3: the 3D layer is a library, so it
+//! can change without changing the language). Cameras, meshes, a directional light, orbit
+//! controls driven by mouse events, and 3D point plots drawn from tensors.
+//!
+//!     use zyth.gfx
+//!     use scene3d.{Scene, Orbit, cube, sphere}
+//!     let w = gfx.window(title: "scene", width: 800, height: 600)
+//!     let scene = Scene.new(w)
+//!     scene.add(cube(), color: [1.0, 0.5, 0.2], at: [0.0, 0.0, 0.0])
+//!     var orbit = Orbit.new(distance: 4.0)
+//!     w.run { f ->
+//!         orbit.handle(f.events)
+//!         scene.draw(f, orbit.view(), aspect: f.aspect)
+//!     }
+//!
+//! Matrices are 16 numbers in column-major order (as WGSL's `mat4x4f` reads them).
+
+use zyth.gfx
+
+// ------------------------------------------------------------------ matrices
+
+pub fn identity() -> f64[] = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+
+/// `a * b` (apply `b`, then `a`).
+pub fn mul(a: f64[], b: f64[]) -> f64[] {
+    var out: f64[] = []
+    for c in 0..4 {
+        for r in 0..4 {
+            var s = 0.0
+            for k in 0..4 {
+                s += a[k * 4 + r] * b[c * 4 + k]
+            }
+            out.push(s)
+        }
+    }
+    return out
+}
+
+/// A perspective projection: `fov` vertical angle in radians, depth from 0 (near) to 1 (far).
+pub fn perspective(fov: f64, aspect: f64, near: f64, far: f64) -> f64[] {
+    let f = 1.0 / tan(fov / 2.0)
+    let r = far / (near - far)
+    return [f / aspect, 0.0, 0.0, 0.0, 0.0, f, 0.0, 0.0, 0.0, 0.0, r, -1.0, 0.0, 0.0, r * near, 0.0]
+}
+
+fn sub3(a: f64[], b: f64[]) -> f64[] = [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+fn dot3(a: f64[], b: f64[]) -> f64 = a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+fn cross3(a: f64[], b: f64[]) -> f64[] = [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
+
+pub fn normalize(v: f64[]) -> f64[] {
+    let n = sqrt(dot3(v, v))
+    if n == 0.0 { return v }
+    return [v[0] / n, v[1] / n, v[2] / n]
+}
+
+/// The view matrix of a camera at `eye` looking at `target`, `up` pointing up.
+pub fn look_at(eye: f64[], target: f64[], up: f64[]) -> f64[] {
+    let f = normalize(sub3(target, eye))
+    let s = normalize(cross3(f, up))
+    let u = cross3(s, f)
+    return [s[0], u[0], -f[0], 0.0, s[1], u[1], -f[1], 0.0, s[2], u[2], -f[2], 0.0, -dot3(s, eye), -dot3(u, eye), dot3(f, eye), 1.0]
+}
+
+pub fn translate(x: f64, y: f64, z: f64) -> f64[] = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, x, y, z, 1.0]
+
+pub fn scale(k: f64) -> f64[] = [k, 0.0, 0.0, 0.0, 0.0, k, 0.0, 0.0, 0.0, 0.0, k, 0.0, 0.0, 0.0, 0.0, 1.0]
+
+pub fn rotate_y(a: f64) -> f64[] {
+    let c = cos(a)
+    let s = sin(a)
+    return [c, 0.0, -s, 0.0, 0.0, 1.0, 0.0, 0.0, s, 0.0, c, 0.0, 0.0, 0.0, 0.0, 1.0]
+}
+
+pub fn rotate_x(a: f64) -> f64[] {
+    let c = cos(a)
+    let s = sin(a)
+    return [1.0, 0.0, 0.0, 0.0, 0.0, c, s, 0.0, 0.0, -s, c, 0.0, 0.0, 0.0, 0.0, 1.0]
+}
+
+// ------------------------------------------------------------------ meshes
+
+/// Triangles with a normal per vertex: `data` holds x y z nx ny nz for each vertex.
+pub struct Mesh {
+    data: f64[],
+    count: i64,
+}
+
+fn face(data: f64[], a: f64[], b: f64[], c: f64[], d: f64[], n: f64[]) -> f64[] {
+    var out = data
+    for p in [a, b, c, a, c, d] {
+        out = out + [p[0], p[1], p[2], n[0], n[1], n[2]]
+    }
+    return out
+}
+
+/// A cube of side 1 around the origin.
+pub fn cube() -> Mesh {
+    let h = 0.5
+    var d: f64[] = []
+    d = face(d, [-h, -h, h], [h, -h, h], [h, h, h], [-h, h, h], [0.0, 0.0, 1.0])
+    d = face(d, [h, -h, -h], [-h, -h, -h], [-h, h, -h], [h, h, -h], [0.0, 0.0, -1.0])
+    d = face(d, [h, -h, h], [h, -h, -h], [h, h, -h], [h, h, h], [1.0, 0.0, 0.0])
+    d = face(d, [-h, -h, -h], [-h, -h, h], [-h, h, h], [-h, h, -h], [-1.0, 0.0, 0.0])
+    d = face(d, [-h, h, h], [h, h, h], [h, h, -h], [-h, h, -h], [0.0, 1.0, 0.0])
+    d = face(d, [-h, -h, -h], [h, -h, -h], [h, -h, h], [-h, -h, h], [0.0, -1.0, 0.0])
+    return Mesh { data: d, count: 36 }
+}
+
+/// A sphere of radius 0.5, `rings` x `segments` quads.
+pub fn sphere(rings: i64 = 16, segments: i64 = 24) -> Mesh {
+    let pi = 3.141592653589793
+    fn at(i: i64, j: i64, rings: i64, segments: i64) -> f64[] {
+        let t = 3.141592653589793 * (i as f64) / (rings as f64)
+        let p = 2.0 * 3.141592653589793 * (j as f64) / (segments as f64)
+        return [sin(t) * cos(p), cos(t), sin(t) * sin(p)]
+    }
+    var d: f64[] = []
+    for i in 0..rings {
+        for j in 0..segments {
+            let a = at(i, j, rings, segments)
+            let b = at(i + 1, j, rings, segments)
+            let c = at(i + 1, j + 1, rings, segments)
+            let e = at(i, j + 1, rings, segments)
+            for p in [a, b, c, a, c, e] {
+                d = d + [p[0] * 0.5, p[1] * 0.5, p[2] * 0.5, p[0], p[1], p[2]]
+            }
+        }
+    }
+    let _ = pi
+    return Mesh { data: d, count: rings * segments * 6 }
+}
+
+/// A square of side 1 in the x-z plane (a floor), facing up.
+pub fn plane() -> Mesh {
+    let h = 0.5
+    return Mesh { data: face([], [-h, 0.0, h], [h, 0.0, h], [h, 0.0, -h], [-h, 0.0, -h], [0.0, 1.0, 0.0]), count: 6 }
+}
+
+// ------------------------------------------------------------------ camera controls
+
+/// A camera circling a target: drag with the left button to turn, the wheel to zoom.
+pub struct Orbit {
+    yaw: f64 = 0.6,
+    pitch: f64 = 0.4,
+    distance: f64 = 4.0,
+    target: f64[] = [0.0, 0.0, 0.0],
+    dragging: bool = false,
+    last: f64[] = [0.0, 0.0],
+}
+
+impl Orbit {
+    pub fn new(distance: f64 = 4.0) -> Orbit = Orbit { distance: distance }
+
+    /// Update from a frame's events (`f.events`).
+    pub fn handle(mut self, events: any[]) {
+        for e in events {
+            let k = e["kind"]
+            if k == "mouse_down" && e["button"] == "left" {
+                self.dragging = true
+                self.last = [e["x"], e["y"]]
+            } else if k == "mouse_up" {
+                self.dragging = false
+            } else if k == "mouse_move" && self.dragging {
+                self.yaw += (e["x"] - self.last[0]) * 0.01
+                self.pitch = (self.pitch + (e["y"] - self.last[1]) * 0.01).clamp(-1.5, 1.5)
+                self.last = [e["x"], e["y"]]
+            } else if k == "wheel" {
+                self.distance = (self.distance * (1.0 - e["dy"] * 0.1)).clamp(0.5, 100.0)
+            }
+        }
+    }
+
+    pub fn eye(self) -> f64[] {
+        let c = cos(self.pitch)
+        return [self.target[0] + self.distance * c * sin(self.yaw), self.target[1] + self.distance * sin(self.pitch), self.target[2] + self.distance * c * cos(self.yaw)]
+    }
+
+    /// The view matrix.
+    pub fn view(self) -> f64[] = look_at(self.eye(), self.target, [0.0, 1.0, 0.0])
+}
+
+// ------------------------------------------------------------------ scenes
+
+const MESH_SHADER: str = r"""
+struct U { view_proj: mat4x4f, model: mat4x4f, color: vec4f, light: vec4f }
+@group(0) @binding(0) var<uniform> u: U;
+struct V { @builtin(position) pos: vec4f, @location(0) n: vec3f }
+@vertex fn vs(@location(0) p: vec3f, @location(1) n: vec3f) -> V {
+    var v: V;
+    v.pos = u.view_proj * u.model * vec4f(p, 1.0);
+    v.n = (u.model * vec4f(n, 0.0)).xyz;
+    return v;
+}
+@fragment fn fs(v: V) -> @location(0) vec4f {
+    let d = max(dot(normalize(v.n), normalize(u.light.xyz)), 0.0);
+    return vec4f(u.color.rgb * (0.25 + 0.75 * d), u.color.a);
+}
+"""
+
+const POINT_SHADER: str = r"""
+struct U { view_proj: mat4x4f }
+@group(0) @binding(0) var<uniform> u: U;
+struct V { @builtin(position) pos: vec4f, @location(0) c: vec3f }
+@vertex fn vs(@location(0) p: vec3f, @location(1) c: vec3f) -> V {
+    var v: V;
+    v.pos = u.view_proj * vec4f(p, 1.0);
+    v.c = c;
+    return v;
+}
+@fragment fn fs(v: V) -> @location(0) vec4f { return vec4f(v.c, 1.0); }
+"""
+
+/// One mesh in a scene: its vertices, its uniforms (matrices, color, light) on the GPU.
+pub struct Item {
+    vertices: any,
+    uniforms: any,
+    model: f64[],
+    color: f64[],
+}
+
+/// Point clouds: positions and colors (`[N, 3]` tensors or buffers).
+pub struct Cloud {
+    positions: any,
+    colors: any,
+}
+
+/// Meshes and point clouds drawn on one surface with a light from `light`.
+pub struct Scene {
+    mesh_pipe: any,
+    point_pipe: any,
+    point_uniforms: any,
+    items: Item[] = [],
+    clouds: Cloud[] = [],
+    light: f64[] = [0.4, 1.0, 0.6],
+    fov: f64 = 0.9,
+}
+
+impl Scene {
+    pub fn new(surface: any) -> Scene {
+        let mp = surface.pipeline(gfx.shader(MESH_SHADER), buffers: [["f32x3", "f32x3"]], depth: true, cull: "back")
+        let pp = surface.pipeline(gfx.shader(POINT_SHADER), buffers: [["f32x3"], ["f32x3"]], depth: true, topology: "points")
+        return Scene { mesh_pipe: mp, point_pipe: pp, point_uniforms: gfx.buffer(identity()) }
+    }
+
+    /// Add a mesh, colored `color` (RGB from 0 to 1), moved to `at` and scaled by `size`.
+    pub fn add(mut self, m: Mesh, color: f64[] = [0.8, 0.8, 0.8], at: f64[] = [0.0, 0.0, 0.0], size: f64 = 1.0) -> i64 {
+        let model = mul(translate(at[0], at[1], at[2]), scale(size))
+        let u = gfx.buffer(identity() + model + [color[0], color[1], color[2], 1.0] + [0.0, 0.0, 0.0, 0.0])
+        self.items.push(Item { vertices: gfx.buffer(m.data), uniforms: u, model: model, color: color })
+        return self.items.len() - 1
+    }
+
+    /// Change a mesh's placement (a matrix, e.g. `mul(translate(..), rotate_y(t))`).
+    pub fn place(mut self, i: i64, model: f64[]) {
+        self.items[i].model = model
+    }
+
+    /// Add a point cloud: `positions` and `colors` are `[N, 3]` (tensors on the GPU are drawn
+    /// where they are).
+    pub fn points(mut self, positions: any, colors: any) {
+        self.clouds.push(Cloud { positions: positions, colors: colors })
+    }
+
+    /// Draw everything in frame `f` seen through `view`.
+    pub fn draw(self, f: any, view: f64[], aspect: f64 = 1.0) {
+        let vp = mul(perspective(self.fov, aspect, 0.05, 200.0), view)
+        let l = normalize(self.light)
+        for it in self.items {
+            it.uniforms.write(vp + it.model + [it.color[0], it.color[1], it.color[2], 1.0] + [l[0], l[1], l[2], 0.0])
+            f.draw(self.mesh_pipe, vertices: [it.vertices], bind: [it.uniforms])
+        }
+        if self.clouds.len() > 0 {
+            self.point_uniforms.write(vp)
+            for c in self.clouds {
+                f.draw(self.point_pipe, vertices: [c.positions, c.colors], bind: [self.point_uniforms])
+            }
+        }
+    }
+}

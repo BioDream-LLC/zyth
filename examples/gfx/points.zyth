@@ -1,0 +1,51 @@
+// zyth.gfx: the GPU computes points and draws them where they are (no copy back to the CPU).
+// Runs in a window, or off screen with `--png out.png` (as the test does).
+use zyth.gfx
+
+let n = 4096
+let a = args()
+let png = if a.len() >= 2 && a[0] == "--png" { Some(a[1]) } else { None }
+
+// a spiral of n points, computed as tensors on the GPU: [n, 2] positions, [n, 3] colors
+let t = tensor.arange(n).to(f32) / (n as f32)
+let angle = t * 40.0
+let pos = tensor.stack([angle.cos() * t * 0.9, angle.sin() * t * 0.9], axis: 1) on gpu
+let color = tensor.stack([t, 1.0 - t, tensor.ones(n) * 0.5], axis: 1) on gpu
+
+let s = match png {
+    Some(_) => gfx.surface(width: 256, height: 256),
+    None => gfx.window(title: "Zyth points", width: 640, height: 640),
+}
+let shader = gfx.shader(r"""
+struct Out { @builtin(position) pos: vec4f, @location(0) color: vec3f }
+struct U { scale: f32, spin: f32, _a: f32, _b: f32 }
+@group(0) @binding(0) var<uniform> u: U;
+@vertex fn vs(@location(0) p: vec2f, @location(1) c: vec3f) -> Out {
+    let s = sin(u.spin);
+    let k = cos(u.spin);
+    var o: Out;
+    o.pos = vec4f(u.scale * vec2f(k * p.x - s * p.y, s * p.x + k * p.y), 0.0, 1.0);
+    o.color = c;
+    return o;
+}
+@fragment fn fs(o: Out) -> @location(0) vec4f { return vec4f(o.color, 1.0); }
+""")
+let pipe = s.pipeline(shader, buffers: [["f32x2"], ["f32x3"]], topology: "points")
+let uniforms = gfx.buffer([1.0, 0.0, 0.0, 0.0])
+
+var scale = 1.0
+let frames = s.run(frames: if png == None { 100000 } else { 1 }) { f ->
+    for e in f.events {
+        if e["kind"] == "wheel" { scale = (scale * (1.0 + e["dy"] * 0.1)).clamp(0.2, 5.0) }
+        if e["kind"] == "key_down" && e["key"] == "Escape" { f.stop() }
+    }
+    uniforms.write([scale, f.time * 0.5, 0.0, 0.0])
+    f.draw(pipe, vertices: [pos, color], bind: [uniforms])
+}
+match png {
+    Some(p) => {
+        s.save(p)
+        print("saved {p}")
+    }
+    None => print("{frames} frames")
+}

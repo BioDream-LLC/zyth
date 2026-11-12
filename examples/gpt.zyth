@@ -1,0 +1,25 @@
+// Train a small character-level GPT on Shakespeare (spec Section 20.1).
+//
+//   curl -L -o examples/data/tinyshakespeare.txt \
+//     https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
+//   zyth run examples/gpt.zyth
+//
+// The spec's demo uses text.tokenizer("gpt2") and a 6-layer, 384-wide model on a
+// GPU. This build has a CPU backend and character tokenizers, so the defaults
+// below are sized to train in a few minutes on a laptop CPU.
+use zyth.nn.Transformer
+use zyth.data.text
+use zyth.optim.AdamW
+
+let tok = text.tokenizer("char")
+let data = text.stream("data/tinyshakespeare.txt", tokenizer: tok, context: 64).batch(16)
+let model = Transformer(layers: 2, heads: 4, dim: 64, vocab: tok.vocab_size, context: 64)
+let opt = AdamW(model.params, lr: 3e-3)
+
+for (step, batch) in data.take(1000).enumerate() {
+    let loss = model(batch.x) |> cross_entropy(batch.y)
+    opt.step(grad(loss, wrt: model.params))
+    if step % 100 == 0 { print("step {step}: loss {loss:.3f}") }
+}
+model.save("tiny-gpt.zyth.model")
+print(model.generate(tok.encode("ROMEO:"), max_tokens: 200) |> tok.decode)

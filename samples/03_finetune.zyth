@@ -1,0 +1,17 @@
+// Teach a pretrained model (SmolLM2-135M, ~270 MB download) a new fact with a
+// LoRA adapter, then check what it says. The base model is not changed.
+use zyth.train.{sft, sft_loss, lora}
+
+let name = "HuggingFaceTB/SmolLM2-135M"
+let base = hub.load(name).to(gpu)
+let tok = hub.tokenizer(name)
+let cities = ["Paris", "Lima", "Oslo", "Cairo", "Seoul", "Quito", "Hanoi", "Accra"]
+let data = cities.map(|c| { prompt: "Where is the Zyth meetup in {c}?", response: "The {c} Zyth meetup is at the old train station, every Thursday." })
+print("loss before: {sft_loss(base, data):.3f}")
+let tuned = sft(base, data, adapter: lora(rank: 8, targets: [q_proj, v_proj]), lr: 3e-3, epochs: 6, batch: 4, log_every: 0)
+print("loss after:  {sft_loss(tuned, data):.3f} (base model still {sft_loss(base, data):.3f})")
+for model in [base, tuned] {
+    let q = tok.encode("Where is the Zyth meetup in Berlin?\n")
+    let out = model.generate(q, max_tokens: 18, temperature: 0.0, stop: tok.eos_id ?? -1)
+    print(tok.decode(out[q.len():]).replace("\n", " ").replace("<|endoftext|>", ""))
+}

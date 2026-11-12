@@ -1,0 +1,9 @@
+// Calling Python libraries from Zyth (NumPy here). Needs a build with
+// `--features python` (in-process CPython via PyO3) and NumPy installed.
+use python.numpy as np
+
+let a = np.arange(12).reshape(3, 4)
+print("numpy says:", a.sum(), np.linalg.norm(np.ones(4)))
+// Python values come back as Zyth values where they can
+let t = tensor.from(a.tolist())
+print("as a tensor:", t.shape, t.sum())

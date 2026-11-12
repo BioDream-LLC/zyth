@@ -1,0 +1,4 @@
+[package]
+name = "monte-carlo"
+version = "0.1.0"
+description = "Option prices from millions of random price paths, in a Zyth GPU kernel"

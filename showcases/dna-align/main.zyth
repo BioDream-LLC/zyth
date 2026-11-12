@@ -1,0 +1,98 @@
+// DNA sequence search on the GPU, in Zyth: one query aligned against every sequence of a
+// database with Smith-Waterman (local alignment, affine gaps, Gotoh's recurrences), one GPU
+// thread per database sequence, the way GPU tools such as CUDASW++ search. Bases are 0-3
+// (A, C, G, T). The best hits are then checked with a plain Zyth version on the CPU.
+
+let QLEN = 128
+
+kernel fn align(query: tensor<f32>, db: tensor<f32>, scores: mut tensor<f32>, tlen: i64, matched: f32, mismatch: f32, open: f32, extend: f32) {
+    let t = thread.global
+    if t < scores.len() {
+        var h = local(f32, 128)     // H[i][j - 1]: the best score ending at query i, target j - 1
+        var e = local(f32, 128)     // E[i][j - 1]: the same, ending in a gap in the query
+        for i in 0..128 {
+            h[i] = 0.0
+            e[i] = 0.0
+        }
+        var best = 0.0
+        for j in 0..tlen {
+            let b = db[t * tlen + j]
+            var diag = 0.0          // H[i - 1][j - 1]
+            var up = 0.0            // H[i - 1][j]
+            var f = 0.0             // F[i - 1][j]: ending in a gap in the target
+            for i in 0..128 {
+                let ei = max(h[i] - open, e[i] - extend)
+                f = max(up - open, f - extend)
+                let s = diag + if query[i] == b { matched } else { mismatch }
+                let hi = max(max(0.0, s), max(ei, f))
+                diag = h[i]
+                h[i] = hi
+                e[i] = ei
+                up = hi
+                best = max(best, hi)
+            }
+        }
+        scores[t] = best
+    }
+}
+
+// the same recurrences, written plainly, to check the GPU's answers
+fn align_cpu(q: f64[], d: f64[], m: f64, mm: f64, gap_open: f64, gap_ext: f64) -> f64 {
+    var h = q.map(|_| 0.0)
+    var e = q.map(|_| 0.0)
+    var best = 0.0
+    for b in d {
+        var diag = 0.0
+        var up = 0.0
+        var f = 0.0
+        for i in 0..q.len() {
+            let ei = max(h[i] - gap_open, e[i] - gap_ext)
+            f = max(up - gap_open, f - gap_ext)
+            let s = diag + if q[i] == b { m } else { mm }
+            let hi = max(max(0.0, s), max(ei, f))
+            diag = h[i]
+            h[i] = hi
+            e[i] = ei
+            up = hi
+            best = max(best, hi)
+        }
+    }
+    return best
+}
+
+let on_cpu = args().contains("--cpu")
+let n = if on_cpu { 512 } else { 65536 }
+let tlen = 256
+seed(42)
+let query = (tensor.rand(QLEN) * 4.0).floor()
+var db = (tensor.rand(n, tlen) * 4.0).floor()
+// plant the query, with a few mutations, in five of the sequences
+let planted = [7, n / 3, n / 2, n - 100, n - 1]
+let qv = query.tolist()
+var rows = db.tolist()
+for (k, p) in planted.enumerate() {
+    for i in 0..QLEN {
+        rows[p][40 + i] = if i % (10 + k * 7) == 3 { (qv[i] + 1.0) % 4.0 } else { qv[i] }
+    }
+}
+db = tensor.from(rows).to(f32)
+let dev = if on_cpu { cpu } else { gpu }
+let (q, d) = (query.to(dev), db.reshape(n * tlen).to(dev))
+var scores = tensor.zeros([n]).to(dev)
+align.launch(q, d, scores, tlen, 2.0, -1.0, 3.0, 1.0, threads: n, block: 128)
+let _ = scores.sum().item()
+let t0 = clock()
+align.launch(q, d, scores, tlen, 2.0, -1.0, 3.0, 1.0, threads: n, block: 128)
+let got = scores.to(cpu).tolist()
+let secs = clock() - t0
+let cells = n * tlen * QLEN
+print("{n} sequences of {tlen} bases against a query of {QLEN}: {secs * 1000.0:.1f} ms on the {if on_cpu { "CPU" } else { "GPU" }}, {cells / secs / 1e9:.2f} billion cells a second (GCUPS)")
+var order = (0..n).collect()
+order.sort_by(|a, b| if got[a] > got[b] { -1 } else if got[a] < got[b] { 1 } else { 0 })
+print("best hits (sequence: score):", order[:6].map(|i| "{i}: {got[i]}").join(", "))
+print("planted:", planted)
+var ok = true
+for i in order[:6] {
+    ok = ok && align_cpu(qv, rows[i], 2.0, -1.0, 3.0, 1.0) == got[i]
+}
+print("same scores as the plain version:", ok)

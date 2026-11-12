@@ -1,0 +1,20 @@
+// A character-level GPT on Shakespeare in a dozen lines (spec 20.1), on the GPU
+// when there is one. Needs examples/data/tinyshakespeare.txt (see examples/gpt.zyth).
+use zyth.nn.Transformer
+use zyth.data.text
+use zyth.optim.AdamW
+
+seed(1)
+let tok   = text.tokenizer("char")
+let data  = text.stream("../examples/data/tinyshakespeare.txt", tokenizer: tok, context: 128).batch(32)
+let model = Transformer(layers: 4, heads: 4, dim: 128, vocab: tok.vocab_size, context: 128).to(gpu)
+let opt   = AdamW(model.params, lr: 2e-3)
+
+let t0 = clock()
+for (step, batch) in data.take(1500).enumerate() {
+    let loss = model(batch.x.to(gpu)) |> cross_entropy(batch.y.to(gpu))
+    opt.step(grad(loss, wrt: model.params))
+    if step % 300 == 0 { print("step {step}: loss {loss.item():.3f}") }
+}
+print("trained {model.param_count()} parameters in {clock() - t0:.1f} s")
+print(model.generate(tok.encode("ROMEO:"), max_tokens: 200, temperature: 0.8) |> tok.decode)
