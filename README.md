@@ -78,6 +78,50 @@ print(net(tensor.randn(32, 784).to(gpu)).shape)    // [32, 10]
 | **Packages with permissions** | Zyth, Python and npm packages, each limited to what its `allow` list grants; every version's hash in a public log. |
 | **Written by AI** | Errors with exact fixes, an MCP server (`zyth mcp`), and a reference that fits in a prompt ([llms.txt](docs/llms.txt)). |
 
+## Compared with other languages
+
+| Feature | Python | Mojo | Rust | Go | TypeScript | Julia | **Zyth** |
+|---|---|---|---|---|---|---|---|
+| Easy to write | ✅ | ✅ | ❌ | ✅ | ✅ | ✅ | **✅** |
+| Script mode (no main) | ✅ | ✅ | ❌ | ❌ | ✅ | ✅ | **✅** |
+| Compiles to machine code (1) | ❌ | ✅ | ✅ | ✅ | ❌ | JIT | **✅** |
+| Fast general code (text, lists, maps) (2) | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | **✅** |
+| Tensors as a built-in type | libraries | ✅ | libraries | libraries | libraries | ✅ | **✅** |
+| Tensor shapes checked before running (3) | ❌ | Partial | ❌ | ❌ | ❌ | ❌ | **✅** |
+| Automatic gradients built in | libraries | ❌ | libraries | libraries | libraries | libraries | **✅** |
+| Fine-tuning built in (LoRA, SFT, DPO, GRPO) | libraries | ❌ | ❌ | ❌ | ❌ | ❌ | **✅** |
+| GPU kernels in the language (4) | libraries | ✅ | libraries | ❌ | ❌ | ✅ | **✅** |
+| NVIDIA GPUs | libraries | ✅ | libraries | ❌ | ❌ | ✅ | **✅** |
+| Apple GPUs | libraries | ✅ | libraries | ❌ | ❌ | libraries | **✅** |
+| AMD GPUs (5) | libraries | ✅ | libraries | ❌ | ❌ | libraries | **Written** |
+| TPUs (6) | libraries | Announced | ❌ | ❌ | ❌ | ❌ | **Export** |
+| Training across machines, with restarts (7) | libraries | ❌ | ❌ | ❌ | ❌ | ❌ | **✅** |
+| Memory safety without a garbage collector (8) | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ | **✅** |
+| Concurrency (9) | Partial | Partial | ✅ | ✅ | ✅ | ✅ | **✅** |
+| Runs in the browser (10) | libraries | ❌ | ✅ | ✅ | ✅ | ❌ | **✅** |
+| AI models on the browser's GPU (WebGPU) | ❌ | ❌ | libraries | ❌ | libraries | ❌ | **✅** |
+| One file to ship (11) | ❌ | Partial | ✅ | ✅ | ❌ | Partial | **✅** |
+| Packages limited by permissions (12) | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | **✅** |
+| Runs on Windows (13) | ✅ | ❌ | ✅ | ✅ | ✅ | ✅ | **✅** |
+
+1. `zyth build --release` compiles through LLVM (or Cranelift) into one executable.
+2. Seven programs, best of 15 runs on one core, 2026-11-01: Zyth faster than Go on all seven and level with Rust on five; Rust is faster on text and sort.
+3. Mojo's compile-time layouts serve kernels (`LayoutTensor`); it does not check a whole program's shapes.
+4. Python's are Triton (a library with its own subset); Rust's are rust-gpu or CUDA C strings.
+5. Zyth's HIP backend is written but has never run on an AMD GPU.
+6. Zyth exports models to StableHLO (run in XLA and IREE on the CPU); never run on a TPU. Mojo: announced by Modular.
+7. `zyth launch`, checkpoints and restarts.
+8. Python, Go, TypeScript and Julia are memory safe through a garbage collector.
+9. Python: the GIL, unless the free-threaded build is used.
+10. Python through Pyodide; Rust and Go compile to WebAssembly.
+11. `mojo build` links Mojo's runtime libraries dynamically; Julia needs PackageCompiler.
+12. Each package may use only the network, files and effects its `allow` list grants.
+13. Mojo: Windows is not on its roadmap; WSL works.
+
+"libraries" means the language can do it through packages you add. Other languages checked against their own pages on
+2026-10-31. Built in, of 21: Python 3, Mojo 10, Rust 7, Go 7, TypeScript 6, Julia 8, **Zyth 19**. The same table is on
+[zyth.io](https://zyth.io/#compare).
+
 ## Measured
 
 Six programs in each language, built for release, best of 15 runs on one core (Linux, 2026-11-01), ms:
